@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-ELEVENLABS_VOICE_ID = "IKne3meq5aSn9XLyUdCD"  # Charlie (British male)
+ELEVENLABS_VOICE_ID = "lUTamkMw7gOzZbFIwmq4"
 ELEVENLABS_API_URL = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}"
 
 
