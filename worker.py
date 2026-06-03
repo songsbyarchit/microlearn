@@ -12,17 +12,13 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from delay_queue import pop_due_replies
-from voice import clean_for_text, save_audio_file, text_to_speech
+from voice import clean_for_text, generate_and_upload_audio
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
-
-PUBLIC_BASE_URL = os.environ.get(
-    "PUBLIC_BASE_URL", "https://microlearn-production.up.railway.app"
-).rstrip("/")
 
 
 async def send_text(to: str, text: str, twilio_sid: str, twilio_token: str, from_number: str) -> None:
@@ -41,19 +37,10 @@ async def send_text(to: str, text: str, twilio_sid: str, twilio_token: str, from
 
 
 async def send_voice(to: str, text: str, twilio_sid: str, twilio_token: str, from_number: str) -> None:
-    """
-    Generate TTS audio, save to /tmp/audio/, and send the public URL via Twilio MediaUrl.
-    Falls back to text if TTS or file saving fails.
-
-    Note: the web process (main.py) serves /audio/{filename} from /tmp/audio/.
-    This only works when the worker and web process share the same filesystem,
-    i.e. they run on the same Railway service/container.
-    """
+    """Generate TTS, upload to R2, send public URL via Twilio MediaUrl."""
     try:
-        audio_bytes = await text_to_speech(text)
-        filename = save_audio_file(audio_bytes)
-        media_url = f"{PUBLIC_BASE_URL}/audio/{filename}"
-        logger.info("Sending voice note via URL: %s", media_url)
+        media_url = await generate_and_upload_audio(text)
+        logger.info("Sending voice note via R2 URL: %s", media_url)
 
         messages_url = f"https://api.twilio.com/2010-04-01/Accounts/{twilio_sid}/Messages.json"
         async with httpx.AsyncClient() as client:

@@ -1,13 +1,15 @@
 """
-voice.py — Whisper transcription, ElevenLabs TTS (primary), OpenAI TTS (fallback).
+voice.py — Whisper transcription, ElevenLabs TTS (primary), OpenAI TTS (fallback),
+           Cloudflare R2 audio hosting.
 """
+import asyncio
 import logging
 import os
 import re
 import tempfile
 import uuid
-from pathlib import Path
 
+import boto3
 import httpx
 from openai import AsyncOpenAI
 
@@ -17,8 +19,6 @@ openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 ELEVENLABS_VOICE_ID = "IKne3meq5aSn9XLyUdCD"  # Charlie (British male)
 ELEVENLABS_API_URL = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}"
-
-AUDIO_DIR = Path("/tmp/audio")
 
 
 # ---------------------------------------------------------------------------
@@ -33,7 +33,7 @@ def post_process_for_tts(text: str) -> str:
 
 
 def clean_for_text(text: str) -> str:
-    """Strip [pause] / [long pause] markers before sending a plain-text WhatsApp message."""
+    """Strip pause markers before sending a plain-text WhatsApp message."""
     text = text.replace("[long pause]", "")
     text = text.replace("[pause]", "")
     text = re.sub(r"  +", " ", text)
@@ -41,20 +41,43 @@ def clean_for_text(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Audio file storage
+# Cloudflare R2 upload
 # ---------------------------------------------------------------------------
 
-def save_audio_file(audio_bytes: bytes) -> str:
+def _r2_upload_sync(audio_bytes: bytes, filename: str) -> str:
     """
-    Save MP3 bytes to /tmp/audio/{uuid}.mp3 and return the filename (uuid.mp3).
-    The FastAPI /audio/{filename} endpoint serves files from this directory.
+    Upload MP3 bytes to Cloudflare R2 (S3-compatible) and return the public URL.
+    Runs synchronously; call via asyncio.to_thread to avoid blocking the event loop.
     """
-    AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+    s3 = boto3.client(
+        "s3",
+        endpoint_url=os.environ["R2_ENDPOINT_URL"],
+        aws_access_key_id=os.environ["R2_ACCESS_KEY_ID"],
+        aws_secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"],
+        region_name="auto",
+    )
+    bucket = os.environ["R2_BUCKET_NAME"]
+    s3.put_object(
+        Bucket=bucket,
+        Key=filename,
+        Body=audio_bytes,
+        ContentType="audio/mpeg",
+    )
+    public_url = os.environ["R2_PUBLIC_URL"].rstrip("/")
+    return f"{public_url}/{filename}"
+
+
+async def generate_and_upload_audio(text: str) -> str:
+    """
+    Generate TTS audio and upload to Cloudflare R2.
+    Returns the public URL of the uploaded MP3.
+    Raises on failure so callers can fall back to text.
+    """
+    audio_bytes = await text_to_speech(text)
     filename = f"{uuid.uuid4()}.mp3"
-    path = AUDIO_DIR / filename
-    path.write_bytes(audio_bytes)
-    logger.info("Saved audio file: %s (%d bytes)", path, len(audio_bytes))
-    return filename
+    public_url = await asyncio.to_thread(_r2_upload_sync, audio_bytes, filename)
+    logger.info("Uploaded audio to R2: %s", public_url)
+    return public_url
 
 
 # ---------------------------------------------------------------------------

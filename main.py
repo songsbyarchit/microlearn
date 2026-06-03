@@ -5,7 +5,6 @@ import logging
 import os
 import random
 from contextlib import asynccontextmanager
-from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -13,12 +12,13 @@ load_dotenv()
 
 import httpx
 from fastapi import FastAPI, Form, Request
-from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse
 
 from brain import get_reply
 from delay_queue import append_history, get_history, pop_next_reply, schedule_reply
-from knowledge_graph import INDEX_FILE, get_all_topics
-from voice import AUDIO_DIR, clean_for_text, save_audio_file, text_to_speech, transcribe_audio
+from knowledge_graph import get_all_topics, get_knowledge_index_markdown
+from supabase_client import ensure_table_exists
+from voice import clean_for_text, generate_and_upload_audio, transcribe_audio
 
 logging.basicConfig(
     level=logging.INFO,
@@ -29,17 +29,14 @@ logger = logging.getLogger(__name__)
 TWILIO_SID = os.environ.get("TWILIO_ACCOUNT_SID", "")
 TWILIO_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
 MY_NUMBER = os.environ.get("MY_WHATSAPP_NUMBER", "")
-PUBLIC_BASE_URL = os.environ.get(
-    "PUBLIC_BASE_URL", "https://microlearn-production.up.railway.app"
-).rstrip("/")
 
 IMMEDIATE_COMMANDS = {"reply", "r"}
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    AUDIO_DIR.mkdir(parents=True, exist_ok=True)
-    logger.info("MicroLearn bot starting up. Audio dir: %s", AUDIO_DIR)
+    ensure_table_exists()
+    logger.info("MicroLearn bot starting up.")
     yield
     logger.info("MicroLearn bot shutting down.")
 
@@ -57,30 +54,14 @@ async def health():
 
 
 # ---------------------------------------------------------------------------
-# Audio file serving
-# ---------------------------------------------------------------------------
-
-@app.get("/audio/{filename}")
-async def serve_audio(filename: str):
-    """Serve a generated TTS audio file from /tmp/audio/."""
-    # Prevent path traversal
-    safe_name = Path(filename).name
-    audio_path = AUDIO_DIR / safe_name
-    if not audio_path.exists():
-        from fastapi import HTTPException
-        raise HTTPException(status_code=404, detail="Audio file not found")
-    return FileResponse(audio_path, media_type="audio/mpeg")
-
-
-# ---------------------------------------------------------------------------
 # Knowledge viewer
 # ---------------------------------------------------------------------------
 
 @app.get("/knowledge", response_class=HTMLResponse)
 async def knowledge_viewer():
-    """Simple HTML knowledge graph viewer."""
+    """Simple HTML knowledge graph viewer backed by Supabase."""
     topics = get_all_topics()
-    index_md = INDEX_FILE.read_text(encoding="utf-8") if INDEX_FILE.exists() else "(empty)"
+    index_md = get_knowledge_index_markdown()
 
     total = len(topics)
     recent = topics[:5]
@@ -94,7 +75,7 @@ async def knowledge_viewer():
         domain_rows += f"<h3>{domain.title()}</h3><ul>"
         for t in domain_topics:
             domain_rows += (
-                f"<li><strong>{t['title']}</strong> "
+                f"<li><strong>{t['title']}</strong>"
                 f"&nbsp; bloom: <code>{t['bloom_level']}</code>"
                 f"&nbsp; <em>{t['summary'][:120]}</em>"
                 f"&nbsp; <small>{t['last_updated']}</small></li>"
@@ -131,7 +112,7 @@ async def knowledge_viewer():
   <h2>All Topics</h2>
   {domain_rows}
 
-  <h2>Raw Index</h2>
+  <h2>Index</h2>
   <pre>{index_md}</pre>
 </body>
 </html>"""
@@ -218,10 +199,8 @@ async def _send_reply(payload: dict) -> None:
     async with httpx.AsyncClient() as client:
         if send_as_voice:
             try:
-                audio_bytes = await text_to_speech(text)
-                filename = save_audio_file(audio_bytes)
-                media_url = f"{PUBLIC_BASE_URL}/audio/{filename}"
-                logger.info("Sending voice note via URL: %s", media_url)
+                media_url = await generate_and_upload_audio(text)
+                logger.info("Sending voice note via R2 URL: %s", media_url)
                 resp = await client.post(
                     messages_url,
                     data={"From": from_number, "To": to, "MediaUrl": media_url},
