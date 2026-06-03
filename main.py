@@ -305,6 +305,26 @@ async def knowledge_viewer():
 # Webhook
 # ---------------------------------------------------------------------------
 
+async def _send_reaction(to: str, emoji: str) -> None:
+    """Send a single emoji as a quick acknowledgement message."""
+    messages_url = f"https://api.twilio.com/2010-04-01/Accounts/{os.environ['TWILIO_ACCOUNT_SID']}/Messages.json"
+    try:
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                messages_url,
+                data={
+                    "From": os.environ["TWILIO_WHATSAPP_NUMBER"],
+                    "To": to,
+                    "Body": emoji,
+                },
+                auth=(os.environ["TWILIO_ACCOUNT_SID"], os.environ["TWILIO_AUTH_TOKEN"]),
+                timeout=10,
+            )
+        logger.info("Sent reaction %s to %s", emoji, to)
+    except Exception as e:
+        logger.warning("Failed to send reaction %s: %s", emoji, e)
+
+
 @app.post("/webhook")
 async def webhook(
     request: Request,
@@ -325,14 +345,10 @@ async def webhook(
         logger.warning("Ignoring message from unknown sender: %s", sender)
         return PlainTextResponse("", status_code=200)
 
-    if body.lower() in IMMEDIATE_COMMANDS:
-        pending = pop_next_reply(sender)
-        if pending:
-            await _send_reply(pending)
-        else:
-            logger.info("No pending reply to send immediately.")
-        return PlainTextResponse("", status_code=200)
-
+    # Resolve message text and track whether it came from a voice note.
+    # This must happen BEFORE the immediate-command check so that transcribed
+    # voice notes containing the word "reply" never accidentally trigger it.
+    is_voice_note = False
     user_text = body
 
     if num_media > 0 and MediaUrl0:
@@ -340,25 +356,41 @@ async def webhook(
         if "audio" in content_type or "ogg" in content_type or "mpeg" in content_type:
             try:
                 user_text = await transcribe_audio(MediaUrl0, TWILIO_SID, TWILIO_TOKEN)
+                is_voice_note = True
                 logger.info("Transcribed voice note: %r", user_text)
             except Exception as e:
                 logger.error("Transcription failed: %s", e)
                 user_text = body or "[voice note -- transcription failed]"
+                is_voice_note = True
         else:
             logger.info("Non-audio media attachment, ignoring media.")
+
+    # Immediate-send command: only valid for plain text messages, not voice notes.
+    if not is_voice_note and body.lower() in IMMEDIATE_COMMANDS:
+        pending = pop_next_reply(sender)
+        if pending:
+            await _send_reply(pending)
+        else:
+            logger.info("No pending reply to send immediately.")
+        return PlainTextResponse("", status_code=200)
 
     if not user_text:
         logger.info("Empty message, ignoring.")
         return PlainTextResponse("", status_code=200)
 
+    # 👀 — seen, thinking
+    await _send_reaction(sender, "👀")
+
     try:
-        # get_reply handles RAG context retrieval and stores the exchange
         reply_text, _kg = await get_reply(user_text)
     except Exception as e:
         logger.error("Brain call failed: %s", e)
         return PlainTextResponse("", status_code=200)
 
     schedule_reply(to_number=sender, reply_text=reply_text, send_as_voice=True)
+
+    # ✅ — reply queued
+    await _send_reaction(sender, "✅")
 
     return PlainTextResponse("", status_code=200)
 

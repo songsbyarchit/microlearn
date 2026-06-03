@@ -126,21 +126,38 @@ def pop_due_replies() -> list[dict[str, Any]]:
 
 def pop_next_reply(to_number: str) -> dict[str, Any] | None:
     """
-    Immediately pop the next pending reply for a given number (used for 'reply now' command).
+    Pop the most recent pending reply for a given number, discarding any older ones.
+    Used for the 'reply now' command.
     """
     redis = _get_redis()
 
     all_items = redis.zrange(QUEUE_KEY, 0, -1, withscores=True)
+
+    # Collect all pending items for this number (item_str, score)
+    matching: list[tuple[str, float]] = []
     for item, score in all_items:
         try:
             payload = json.loads(item)
         except json.JSONDecodeError:
             continue
         if payload.get("to") == to_number:
-            redis.zrem(QUEUE_KEY, item)
-            logger.info("Immediately popped reply for %s", to_number)
-            return payload
-    return None
+            matching.append((item, float(score)))
+
+    if not matching:
+        return None
+
+    # Remove every pending reply for this number
+    for item, _ in matching:
+        redis.zrem(QUEUE_KEY, item)
+
+    # Return the one with the highest scheduled timestamp (most recently queued)
+    most_recent_item, _ = max(matching, key=lambda x: x[1])
+    logger.info(
+        "Popped most recent reply for %s (discarded %d older)",
+        to_number,
+        len(matching) - 1,
+    )
+    return json.loads(most_recent_item)
 
 
 # ---- Conversation history helpers ----
