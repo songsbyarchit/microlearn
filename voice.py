@@ -124,6 +124,7 @@ async def transcribe_audio(audio_url: str, twilio_sid: str, twilio_token: str) -
 async def _elevenlabs_tts(text: str, api_key: str) -> bytes:
     """Call ElevenLabs TTS and return raw MP3 bytes."""
     logger.info(f"ElevenLabs key starts with: {api_key[:8] if api_key else 'EMPTY'}")
+    logger.info(f"ElevenLabs voice ID: {ELEVENLABS_VOICE_ID}")
     ssml_text = post_process_for_tts(text)
     payload = {
         "text": ssml_text,
