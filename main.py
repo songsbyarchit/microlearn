@@ -1,21 +1,23 @@
 """
-main.py — FastAPI app with Twilio WhatsApp webhook.
+main.py — FastAPI app with Twilio WhatsApp webhook and knowledge viewer.
 """
 import logging
 import os
 import random
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from dotenv import load_dotenv
 
 load_dotenv()
 
-from fastapi import FastAPI, Form, Request, Response
-from fastapi.responses import PlainTextResponse
+from fastapi import FastAPI, Form, Request
+from fastapi.responses import HTMLResponse, PlainTextResponse
 
 from brain import get_reply
 from delay_queue import append_history, get_history, pop_next_reply, schedule_reply
-from voice import transcribe_audio
+from knowledge_graph import INDEX_FILE, get_all_topics
+from voice import clean_for_text, transcribe_audio
 
 logging.basicConfig(
     level=logging.INFO,
@@ -40,10 +42,85 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="MicroLearn", lifespan=lifespan)
 
 
+# ---------------------------------------------------------------------------
+# Health
+# ---------------------------------------------------------------------------
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}
 
+
+# ---------------------------------------------------------------------------
+# Knowledge viewer
+# ---------------------------------------------------------------------------
+
+@app.get("/knowledge", response_class=HTMLResponse)
+async def knowledge_viewer():
+    """Simple HTML knowledge graph viewer."""
+    topics = get_all_topics()
+    index_md = INDEX_FILE.read_text(encoding="utf-8") if INDEX_FILE.exists() else "(empty)"
+
+    total = len(topics)
+    recent = topics[:5]  # already sorted by last_updated desc
+
+    # Build domain sections
+    domains: dict[str, list[dict]] = {}
+    for t in topics:
+        domains.setdefault(t["domain"], []).append(t)
+
+    domain_rows = ""
+    for domain, domain_topics in sorted(domains.items()):
+        domain_rows += f"<h3>{domain.title()}</h3><ul>"
+        for t in domain_topics:
+            domain_rows += (
+                f"<li><strong>{t['title']}</strong> "
+                f"&nbsp; bloom: <code>{t['bloom_level']}</code>"
+                f"&nbsp; <em>{t['summary'][:120]}</em>"
+                f"&nbsp; <small>{t['last_updated']}</small></li>"
+            )
+        domain_rows += "</ul>"
+
+    recent_rows = "".join(
+        f"<li>{t['title']} ({t['domain']}) &mdash; bloom {t['bloom_level']} &mdash; {t['last_updated']}</li>"
+        for t in recent
+    )
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>MicroLearn Knowledge Graph</title>
+  <style>
+    body {{ font-family: monospace; max-width: 900px; margin: 40px auto; padding: 0 20px; }}
+    h1 {{ border-bottom: 2px solid #333; }}
+    h2 {{ margin-top: 2em; }}
+    code {{ background: #eee; padding: 2px 4px; }}
+    pre {{ background: #f4f4f4; padding: 1em; overflow-x: auto; white-space: pre-wrap; }}
+  </style>
+</head>
+<body>
+  <h1>MicroLearn Knowledge Graph</h1>
+
+  <h2>Stats</h2>
+  <p>Total topics: <strong>{total}</strong></p>
+
+  <h2>Most Recent</h2>
+  <ul>{recent_rows}</ul>
+
+  <h2>All Topics</h2>
+  {domain_rows}
+
+  <h2>Raw Index</h2>
+  <pre>{index_md}</pre>
+</body>
+</html>"""
+    return HTMLResponse(content=html)
+
+
+# ---------------------------------------------------------------------------
+# Webhook
+# ---------------------------------------------------------------------------
 
 @app.post("/webhook")
 async def webhook(
@@ -86,7 +163,7 @@ async def webhook(
                 logger.info("Transcribed voice note: %r", user_text)
             except Exception as e:
                 logger.error("Transcription failed: %s", e)
-                user_text = body or "[voice note — transcription failed]"
+                user_text = body or "[voice note -- transcription failed]"
         else:
             logger.info("Non-audio media attachment, ignoring media.")
 
@@ -102,21 +179,19 @@ async def webhook(
         logger.error("Brain call failed: %s", e)
         return PlainTextResponse("", status_code=200)
 
-    # Persist to history
+    # Persist to history (store raw reply with pause markers)
     append_history(sender, "user", user_text)
     append_history(sender, "assistant", reply_text)
 
     # Decide voice vs text (70/30)
     send_as_voice = random.random() < 0.70
 
-    # Schedule with delay
     schedule_reply(
         to_number=sender,
         reply_text=reply_text,
         send_as_voice=send_as_voice,
     )
 
-    # Twilio expects a 200 with empty TwiML or plain body
     return PlainTextResponse("", status_code=200)
 
 
@@ -139,14 +214,9 @@ async def _send_reply(payload: dict) -> None:
         if send_as_voice:
             try:
                 audio_bytes = await text_to_speech(text)
-                # Upload audio to Twilio MMS / hosted media
-                # Twilio WhatsApp voice notes require a publicly accessible URL.
-                # We use Twilio's own media hosting: upload via helper endpoint.
-                # For simplicity in V1, fall back to text if upload not configured.
-                # TODO: integrate with a storage bucket (S3/R2) for audio hosting.
-                logger.warning(
-                    "Voice note storage not yet configured — falling back to text."
-                )
+                # TODO: upload audio_bytes to S3/R2, get public_url, then send via Twilio MediaUrl.
+                # Until storage is wired up, fall back to text.
+                logger.warning("Voice storage not configured, falling back to text.")
                 send_as_voice = False
             except Exception as e:
                 logger.error("TTS generation failed: %s", e)
@@ -156,7 +226,7 @@ async def _send_reply(payload: dict) -> None:
             data = {
                 "From": from_number,
                 "To": to,
-                "Body": text,
+                "Body": clean_for_text(text),
             }
             resp = await client.post(
                 messages_url,

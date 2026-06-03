@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from delay_queue import pop_due_replies
-from voice import text_to_speech
+from voice import clean_for_text, text_to_speech
 
 logging.basicConfig(
     level=logging.INFO,
@@ -26,7 +26,7 @@ async def send_text(to: str, text: str, twilio_sid: str, twilio_token: str, from
     async with httpx.AsyncClient() as client:
         resp = await client.post(
             messages_url,
-            data={"From": from_number, "To": to, "Body": text},
+            data={"From": from_number, "To": to, "Body": clean_for_text(text)},
             auth=(twilio_sid, twilio_token),
             timeout=15,
         )
@@ -41,17 +41,15 @@ async def send_voice(to: str, text: str, twilio_sid: str, twilio_token: str, fro
     Generate TTS audio and send as a WhatsApp voice note.
 
     WhatsApp voice notes sent via Twilio require a publicly accessible MP3/OGG URL.
-    In V1 we generate the audio but need a storage layer (S3, Cloudflare R2, etc.)
-    to host it. Until that's wired up, we fall back to text.
+    Until a storage layer (S3, Cloudflare R2, etc.) is wired up, falls back to text.
 
     To enable full voice:
-    1. Upload `audio_bytes` to your storage bucket.
-    2. Pass the public URL as `MediaUrl` in the Twilio request below.
+    1. Upload audio_bytes to your storage bucket.
+    2. Pass the public URL as MediaUrl in the Twilio request.
     """
     try:
         audio_bytes = await text_to_speech(text)
         # TODO: upload audio_bytes to S3/R2 and get public_url
-        # For now, log and fall back to text.
         logger.warning(
             "Voice storage not configured (%d bytes generated), falling back to text.", len(audio_bytes)
         )
