@@ -10,9 +10,10 @@ logger = logging.getLogger(__name__)
 
 _client: Client | None = None
 
-CREATE_TABLE_SQL = """
+SETUP_SQL = """
 -- Run this once in the Supabase dashboard SQL editor:
 
+-- 1. Knowledge graph nodes
 CREATE TABLE IF NOT EXISTS knowledge_nodes (
     id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     domain      text NOT NULL,
@@ -23,6 +24,41 @@ CREATE TABLE IF NOT EXISTS knowledge_nodes (
     updated_at  timestamptz DEFAULT now(),
     UNIQUE (domain, topic)
 );
+
+-- 2. Conversation history with pgvector for semantic search
+CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE TABLE IF NOT EXISTS conversation_history (
+    id         uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    role       text,
+    content    text,
+    embedding  vector(1536),
+    created_at timestamptz DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS conversation_history_embedding_idx
+    ON conversation_history USING ivfflat (embedding vector_cosine_ops)
+    WITH (lists = 100);
+
+-- 3. RPC function for semantic similarity search
+CREATE OR REPLACE FUNCTION match_conversation_history(
+    query_embedding vector(1536),
+    match_count     int DEFAULT 8
+)
+RETURNS TABLE(role text, content text, created_at timestamptz, similarity float)
+LANGUAGE plpgsql AS $$
+BEGIN
+    RETURN QUERY
+    SELECT
+        ch.role,
+        ch.content,
+        ch.created_at,
+        1 - (ch.embedding <=> query_embedding) AS similarity
+    FROM conversation_history ch
+    ORDER BY ch.embedding <=> query_embedding
+    LIMIT match_count;
+END;
+$$;
 """
 
 
@@ -38,17 +74,23 @@ def get_supabase() -> Client:
 
 def ensure_table_exists() -> None:
     """
-    Verify the knowledge_nodes table is reachable.
-    If not, log the SQL needed to create it and raise so startup fails loudly.
+    Verify both required tables are reachable on startup.
+    If either is missing, log the full setup SQL and raise.
     """
-    try:
-        get_supabase().table("knowledge_nodes").select("id").limit(1).execute()
-        logger.info("knowledge_nodes table verified.")
-    except Exception as e:
+    sb = get_supabase()
+    errors = []
+
+    for table in ("knowledge_nodes", "conversation_history"):
+        try:
+            sb.table(table).select("id").limit(1).execute()
+            logger.info("Table '%s' verified.", table)
+        except Exception as e:
+            errors.append(f"{table}: {e}")
+
+    if errors:
         logger.error(
-            "Cannot reach knowledge_nodes table: %s\n"
-            "Create it in the Supabase dashboard SQL editor:\n%s",
-            e,
-            CREATE_TABLE_SQL,
+            "Missing Supabase tables: %s\nRun the following SQL in the Supabase dashboard:\n%s",
+            errors,
+            SETUP_SQL,
         )
-        raise
+        raise RuntimeError(f"Supabase setup incomplete: {errors}")

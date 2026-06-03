@@ -1,18 +1,23 @@
 """
-brain.py — Claude API calls and system prompt construction.
+brain.py — Claude API calls, semantic RAG context retrieval, system prompt construction.
 """
+import json
 import logging
 import os
 import re
+from datetime import datetime, timezone
 from typing import Any
 
 import anthropic
+from openai import AsyncOpenAI
 
 from knowledge_graph import get_selective_context, parse_kg_json_from_response, update_knowledge_graph
+from supabase_client import get_supabase
 
 logger = logging.getLogger(__name__)
 
 claude = anthropic.AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 SYSTEM_PROMPT_TEMPLATE = """\
 You are a brilliant curious friend -- Feynman meets WhatsApp.
@@ -112,26 +117,102 @@ def _extract_reply(full_text: str) -> str:
     return clean.strip()
 
 
-async def get_reply(
-    user_message: str,
-    history: list[dict[str, str]],
-) -> tuple[str, dict[str, Any] | None]:
+# ---------------------------------------------------------------------------
+# Semantic RAG
+# ---------------------------------------------------------------------------
+
+async def _embed(text: str) -> list[float]:
+    """Generate a 1536-dim embedding using OpenAI text-embedding-3-small."""
+    response = await openai_client.embeddings.create(
+        input=text,
+        model="text-embedding-3-small",
+    )
+    return response.data[0].embedding
+
+
+async def store_message(role: str, content: str) -> None:
+    """Embed and store a message in Supabase conversation_history."""
+    try:
+        embedding = await _embed(content)
+        get_supabase().table("conversation_history").insert({
+            "role": role,
+            "content": content,
+            "embedding": json.dumps(embedding),
+            "created_at": datetime.now(tz=timezone.utc).isoformat(),
+        }).execute()
+        logger.info("Stored %s message in conversation_history.", role)
+    except Exception as e:
+        logger.warning("Failed to store message: %s", e)
+
+
+async def get_relevant_context(user_message: str) -> list[dict[str, str]]:
     """
-    Call Claude with selective knowledge context and conversation history.
+    Return the most relevant past messages for the current user message.
+
+    - Embeds the user message.
+    - Fetches the 8 most semantically similar past messages via pgvector RPC.
+    - Always includes the last 3 messages by recency for immediate context.
+    - Merges, deduplicates, and sorts chronologically.
+    """
+    sb = get_supabase()
+
+    try:
+        embedding = await _embed(user_message)
+        embedding_str = json.dumps(embedding)
+
+        # Semantic similarity via RPC
+        semantic_res = sb.rpc(
+            "match_conversation_history",
+            {"query_embedding": embedding_str, "match_count": 8},
+        ).execute()
+        semantic_rows = semantic_res.data or []
+
+        # Last 3 messages by recency (chronological order)
+        recent_res = (
+            sb.table("conversation_history")
+            .select("role,content,created_at")
+            .order("created_at", desc=True)
+            .limit(3)
+            .execute()
+        )
+        recent_rows = list(reversed(recent_res.data or []))
+
+        # Merge: prioritise recent, backfill with semantic hits
+        seen = {r["content"] for r in recent_rows}
+        combined = list(recent_rows)
+        for row in semantic_rows:
+            if row["content"] not in seen:
+                combined.append(row)
+                seen.add(row["content"])
+
+        combined.sort(key=lambda x: x.get("created_at", ""))
+        logger.info("RAG context: %d messages retrieved.", len(combined))
+        return [{"role": r["role"], "content": r["content"]} for r in combined]
+
+    except Exception as e:
+        logger.warning("Failed to retrieve RAG context: %s", e)
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
+async def get_reply(user_message: str) -> tuple[str, dict[str, Any] | None]:
+    """
+    Build context via semantic RAG, call Claude, store the exchange.
     Returns (reply_text, kg_update_dict | None).
     """
     knowledge_context = get_selective_context(user_message, max_tokens=500)
     bloom_info = "Unknown -- treat as beginner, introduce gently."
-
     system_prompt = _build_system_prompt(knowledge_context, bloom_info)
 
-    # Last 6 messages of history + current message
-    messages: list[dict[str, str]] = []
-    for h in history[-6:]:
-        messages.append({"role": h["role"], "content": h["content"]})
+    history = await get_relevant_context(user_message)
+
+    messages: list[dict[str, str]] = list(history)
     messages.append({"role": "user", "content": user_message})
 
-    logger.info("Calling Claude with %d messages in context", len(messages))
+    logger.info("Calling Claude with %d context messages.", len(messages))
 
     response = await claude.messages.create(
         model="claude-sonnet-4-6",
@@ -151,5 +232,9 @@ async def get_reply(
             update_knowledge_graph(kg_update)
         except Exception as e:
             logger.warning("Failed to update knowledge graph: %s", e)
+
+    # Store this exchange for future retrieval
+    await store_message("user", user_message)
+    await store_message("assistant", reply)
 
     return reply, kg_update

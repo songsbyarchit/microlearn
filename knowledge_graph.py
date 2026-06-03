@@ -225,12 +225,15 @@ def get_all_topics() -> list[dict[str, Any]]:
         content = row.get("content", "")
         summary = _extract_summary(content)
         results.append({
+            "id": f"{row['domain']}/{row['topic']}",
             "title": row["topic"].title(),
+            "topic": row["topic"],
             "domain": row["domain"],
             "bloom_level": row.get("bloom_score", 0),
             "last_updated": row.get("updated_at", ""),
             "summary": summary,
             "raw": content,
+            "edges": row.get("edges") or [],
         })
     return results
 
