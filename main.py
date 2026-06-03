@@ -11,13 +11,14 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+import httpx
 from fastapi import FastAPI, Form, Request
-from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 
 from brain import get_reply
 from delay_queue import append_history, get_history, pop_next_reply, schedule_reply
 from knowledge_graph import INDEX_FILE, get_all_topics
-from voice import clean_for_text, transcribe_audio
+from voice import AUDIO_DIR, clean_for_text, save_audio_file, text_to_speech, transcribe_audio
 
 logging.basicConfig(
     level=logging.INFO,
@@ -28,13 +29,17 @@ logger = logging.getLogger(__name__)
 TWILIO_SID = os.environ.get("TWILIO_ACCOUNT_SID", "")
 TWILIO_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
 MY_NUMBER = os.environ.get("MY_WHATSAPP_NUMBER", "")
+PUBLIC_BASE_URL = os.environ.get(
+    "PUBLIC_BASE_URL", "https://microlearn-production.up.railway.app"
+).rstrip("/")
 
 IMMEDIATE_COMMANDS = {"reply", "r"}
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("MicroLearn bot starting up.")
+    AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+    logger.info("MicroLearn bot starting up. Audio dir: %s", AUDIO_DIR)
     yield
     logger.info("MicroLearn bot shutting down.")
 
@@ -52,6 +57,22 @@ async def health():
 
 
 # ---------------------------------------------------------------------------
+# Audio file serving
+# ---------------------------------------------------------------------------
+
+@app.get("/audio/{filename}")
+async def serve_audio(filename: str):
+    """Serve a generated TTS audio file from /tmp/audio/."""
+    # Prevent path traversal
+    safe_name = Path(filename).name
+    audio_path = AUDIO_DIR / safe_name
+    if not audio_path.exists():
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="Audio file not found")
+    return FileResponse(audio_path, media_type="audio/mpeg")
+
+
+# ---------------------------------------------------------------------------
 # Knowledge viewer
 # ---------------------------------------------------------------------------
 
@@ -62,9 +83,8 @@ async def knowledge_viewer():
     index_md = INDEX_FILE.read_text(encoding="utf-8") if INDEX_FILE.exists() else "(empty)"
 
     total = len(topics)
-    recent = topics[:5]  # already sorted by last_updated desc
+    recent = topics[:5]
 
-    # Build domain sections
     domains: dict[str, list[dict]] = {}
     for t in topics:
         domains.setdefault(t["domain"], []).append(t)
@@ -138,12 +158,10 @@ async def webhook(
 
     logger.info("Inbound from %s | body=%r | media=%d", sender, body, num_media)
 
-    # Only respond to my own number
     if MY_NUMBER and sender != MY_NUMBER:
         logger.warning("Ignoring message from unknown sender: %s", sender)
         return PlainTextResponse("", status_code=200)
 
-    # Handle immediate-send commands
     if body.lower() in IMMEDIATE_COMMANDS:
         pending = pop_next_reply(sender)
         if pending:
@@ -152,7 +170,6 @@ async def webhook(
             logger.info("No pending reply to send immediately.")
         return PlainTextResponse("", status_code=200)
 
-    # Determine the actual text content
     user_text = body
 
     if num_media > 0 and MediaUrl0:
@@ -171,7 +188,6 @@ async def webhook(
         logger.info("Empty message, ignoring.")
         return PlainTextResponse("", status_code=200)
 
-    # Fetch history and generate reply
     history = get_history(sender)
     try:
         reply_text, _kg = await get_reply(user_text, history)
@@ -179,27 +195,17 @@ async def webhook(
         logger.error("Brain call failed: %s", e)
         return PlainTextResponse("", status_code=200)
 
-    # Persist to history (store raw reply with pause markers)
     append_history(sender, "user", user_text)
     append_history(sender, "assistant", reply_text)
 
-    # Decide voice vs text (70/30)
     send_as_voice = random.random() < 0.70
-
-    schedule_reply(
-        to_number=sender,
-        reply_text=reply_text,
-        send_as_voice=send_as_voice,
-    )
+    schedule_reply(to_number=sender, reply_text=reply_text, send_as_voice=send_as_voice)
 
     return PlainTextResponse("", status_code=200)
 
 
 async def _send_reply(payload: dict) -> None:
     """Send a single reply payload (text or voice) via Twilio."""
-    import httpx
-    from voice import text_to_speech
-
     to = payload["to"]
     text = payload["text"]
     send_as_voice = payload.get("voice", False)
@@ -207,34 +213,37 @@ async def _send_reply(payload: dict) -> None:
     twilio_sid = os.environ["TWILIO_ACCOUNT_SID"]
     twilio_token = os.environ["TWILIO_AUTH_TOKEN"]
     from_number = os.environ["TWILIO_WHATSAPP_NUMBER"]
-
     messages_url = f"https://api.twilio.com/2010-04-01/Accounts/{twilio_sid}/Messages.json"
 
     async with httpx.AsyncClient() as client:
         if send_as_voice:
             try:
                 audio_bytes = await text_to_speech(text)
-                # TODO: upload audio_bytes to S3/R2, get public_url, then send via Twilio MediaUrl.
-                # Until storage is wired up, fall back to text.
-                logger.warning("Voice storage not configured, falling back to text.")
-                send_as_voice = False
+                filename = save_audio_file(audio_bytes)
+                media_url = f"{PUBLIC_BASE_URL}/audio/{filename}"
+                logger.info("Sending voice note via URL: %s", media_url)
+                resp = await client.post(
+                    messages_url,
+                    data={"From": from_number, "To": to, "MediaUrl": media_url},
+                    auth=(twilio_sid, twilio_token),
+                    timeout=15,
+                )
+                if resp.status_code >= 400:
+                    logger.error("Twilio voice send failed %d: %s", resp.status_code, resp.text)
+                else:
+                    logger.info("Sent voice reply to %s", to)
+                return
             except Exception as e:
-                logger.error("TTS generation failed: %s", e)
-                send_as_voice = False
+                logger.error("Voice send failed, falling back to text: %s", e)
 
-        if not send_as_voice:
-            data = {
-                "From": from_number,
-                "To": to,
-                "Body": clean_for_text(text),
-            }
-            resp = await client.post(
-                messages_url,
-                data=data,
-                auth=(twilio_sid, twilio_token),
-                timeout=15,
-            )
-            if resp.status_code >= 400:
-                logger.error("Twilio send failed %d: %s", resp.status_code, resp.text)
-            else:
-                logger.info("Sent text reply to %s", to)
+        # Text fallback
+        resp = await client.post(
+            messages_url,
+            data={"From": from_number, "To": to, "Body": clean_for_text(text)},
+            auth=(twilio_sid, twilio_token),
+            timeout=15,
+        )
+        if resp.status_code >= 400:
+            logger.error("Twilio text send failed %d: %s", resp.status_code, resp.text)
+        else:
+            logger.info("Sent text reply to %s", to)

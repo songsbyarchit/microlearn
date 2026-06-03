@@ -12,13 +12,17 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from delay_queue import pop_due_replies
-from voice import clean_for_text, text_to_speech
+from voice import clean_for_text, save_audio_file, text_to_speech
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+PUBLIC_BASE_URL = os.environ.get(
+    "PUBLIC_BASE_URL", "https://microlearn-production.up.railway.app"
+).rstrip("/")
 
 
 async def send_text(to: str, text: str, twilio_sid: str, twilio_token: str, from_number: str) -> None:
@@ -38,24 +42,33 @@ async def send_text(to: str, text: str, twilio_sid: str, twilio_token: str, from
 
 async def send_voice(to: str, text: str, twilio_sid: str, twilio_token: str, from_number: str) -> None:
     """
-    Generate TTS audio and send as a WhatsApp voice note.
+    Generate TTS audio, save to /tmp/audio/, and send the public URL via Twilio MediaUrl.
+    Falls back to text if TTS or file saving fails.
 
-    WhatsApp voice notes sent via Twilio require a publicly accessible MP3/OGG URL.
-    Until a storage layer (S3, Cloudflare R2, etc.) is wired up, falls back to text.
-
-    To enable full voice:
-    1. Upload audio_bytes to your storage bucket.
-    2. Pass the public URL as MediaUrl in the Twilio request.
+    Note: the web process (main.py) serves /audio/{filename} from /tmp/audio/.
+    This only works when the worker and web process share the same filesystem,
+    i.e. they run on the same Railway service/container.
     """
     try:
         audio_bytes = await text_to_speech(text)
-        # TODO: upload audio_bytes to S3/R2 and get public_url
-        logger.warning(
-            "Voice storage not configured (%d bytes generated), falling back to text.", len(audio_bytes)
-        )
-        await send_text(to, text, twilio_sid, twilio_token, from_number)
+        filename = save_audio_file(audio_bytes)
+        media_url = f"{PUBLIC_BASE_URL}/audio/{filename}"
+        logger.info("Sending voice note via URL: %s", media_url)
+
+        messages_url = f"https://api.twilio.com/2010-04-01/Accounts/{twilio_sid}/Messages.json"
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                messages_url,
+                data={"From": from_number, "To": to, "MediaUrl": media_url},
+                auth=(twilio_sid, twilio_token),
+                timeout=15,
+            )
+            if resp.status_code >= 400:
+                logger.error("Twilio voice send failed %d: %s", resp.status_code, resp.text)
+            else:
+                logger.info("Sent voice reply to %s", to)
     except Exception as e:
-        logger.error("TTS failed, falling back to text: %s", e)
+        logger.error("Voice send failed, falling back to text: %s", e)
         await send_text(to, text, twilio_sid, twilio_token, from_number)
 
 

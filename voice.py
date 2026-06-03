@@ -5,6 +5,8 @@ import logging
 import os
 import re
 import tempfile
+import uuid
+from pathlib import Path
 
 import httpx
 from openai import AsyncOpenAI
@@ -15,6 +17,8 @@ openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 ELEVENLABS_VOICE_ID = "pNInz6obpgDQGcFmaJgB"  # Adam
 ELEVENLABS_API_URL = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}"
+
+AUDIO_DIR = Path("/tmp/audio")
 
 
 # ---------------------------------------------------------------------------
@@ -32,9 +36,25 @@ def clean_for_text(text: str) -> str:
     """Strip [pause] / [long pause] markers before sending a plain-text WhatsApp message."""
     text = text.replace("[long pause]", "")
     text = text.replace("[pause]", "")
-    # Collapse any double spaces left behind
     text = re.sub(r"  +", " ", text)
     return text.strip()
+
+
+# ---------------------------------------------------------------------------
+# Audio file storage
+# ---------------------------------------------------------------------------
+
+def save_audio_file(audio_bytes: bytes) -> str:
+    """
+    Save MP3 bytes to /tmp/audio/{uuid}.mp3 and return the filename (uuid.mp3).
+    The FastAPI /audio/{filename} endpoint serves files from this directory.
+    """
+    AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+    filename = f"{uuid.uuid4()}.mp3"
+    path = AUDIO_DIR / filename
+    path.write_bytes(audio_bytes)
+    logger.info("Saved audio file: %s (%d bytes)", path, len(audio_bytes))
+    return filename
 
 
 # ---------------------------------------------------------------------------
@@ -78,9 +98,8 @@ async def transcribe_audio(audio_url: str, twilio_sid: str, twilio_token: str) -
 # TTS
 # ---------------------------------------------------------------------------
 
-async def _elevenlabs_tts(text: str) -> bytes:
+async def _elevenlabs_tts(text: str, api_key: str) -> bytes:
     """Call ElevenLabs TTS and return raw MP3 bytes."""
-    api_key = os.environ["ELEVENLABS_API_KEY"]
     ssml_text = post_process_for_tts(text)
     payload = {
         "text": ssml_text,
@@ -105,12 +124,11 @@ async def _elevenlabs_tts(text: str) -> bytes:
 
 
 async def _openai_tts(text: str) -> bytes:
-    """OpenAI TTS fallback — returns raw MP3 bytes."""
-    clean = clean_for_text(text)  # OpenAI TTS doesn't support SSML
+    """OpenAI TTS fallback -- returns raw MP3 bytes."""
     response = await openai_client.audio.speech.create(
         model="tts-1",
         voice="alloy",
-        input=clean,
+        input=clean_for_text(text),
         response_format="mp3",
     )
     return response.content
@@ -123,10 +141,10 @@ async def text_to_speech(text: str) -> bytes:
     """
     logger.info("Generating TTS (%d chars)", len(text))
 
-    elevenlabs_key = os.getenv("ELEVENLABS_API_KEY", "")
-    if elevenlabs_key:
+    api_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
+    if api_key:
         try:
-            audio = await _elevenlabs_tts(text)
+            audio = await _elevenlabs_tts(text, api_key)
             logger.info("ElevenLabs TTS ok (%d bytes)", len(audio))
             return audio
         except Exception as e:
