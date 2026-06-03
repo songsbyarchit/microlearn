@@ -198,7 +198,7 @@ async def webhook(
     append_history(sender, "user", user_text)
     append_history(sender, "assistant", reply_text)
 
-    send_as_voice = random.random() < 0.70
+    send_as_voice = True
     schedule_reply(to_number=sender, reply_text=reply_text, send_as_voice=send_as_voice)
 
     return PlainTextResponse("", status_code=200)
