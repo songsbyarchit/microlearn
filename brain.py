@@ -8,11 +8,12 @@ import re
 from datetime import datetime, timezone
 from typing import Any
 
+import httpx
 import anthropic
 from openai import AsyncOpenAI
 
 from knowledge_graph import get_selective_context, parse_kg_json_from_response, update_knowledge_graph
-from supabase_client import get_supabase
+from supabase_client import sb_headers, sb_url
 
 logger = logging.getLogger(__name__)
 
@@ -134,12 +135,19 @@ async def store_message(role: str, content: str) -> None:
     """Embed and store a message in Supabase conversation_history."""
     try:
         embedding = await _embed(content)
-        get_supabase().table("conversation_history").insert({
-            "role": role,
-            "content": content,
-            "embedding": json.dumps(embedding),
-            "created_at": datetime.now(tz=timezone.utc).isoformat(),
-        }).execute()
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                sb_url("/rest/v1/conversation_history"),
+                headers=sb_headers(),
+                content=json.dumps({
+                    "role": role,
+                    "content": content,
+                    "embedding": json.dumps(embedding),
+                    "created_at": datetime.now(tz=timezone.utc).isoformat(),
+                }),
+                timeout=10,
+            )
+            resp.raise_for_status()
         logger.info("Stored %s message in conversation_history.", role)
     except Exception as e:
         logger.warning("Failed to store message: %s", e)
@@ -154,28 +162,30 @@ async def get_relevant_context(user_message: str) -> list[dict[str, str]]:
     - Always includes the last 3 messages by recency for immediate context.
     - Merges, deduplicates, and sorts chronologically.
     """
-    sb = get_supabase()
-
     try:
         embedding = await _embed(user_message)
         embedding_str = json.dumps(embedding)
 
-        # Semantic similarity via RPC
-        semantic_res = sb.rpc(
-            "match_conversation_history",
-            {"query_embedding": embedding_str, "match_count": 8},
-        ).execute()
-        semantic_rows = semantic_res.data or []
+        async with httpx.AsyncClient() as client:
+            # Semantic similarity via RPC
+            rpc_resp = await client.post(
+                sb_url("/rest/v1/rpc/match_conversation_history"),
+                headers=sb_headers(),
+                content=json.dumps({"query_embedding": embedding_str, "match_count": 8}),
+                timeout=10,
+            )
+            rpc_resp.raise_for_status()
+            semantic_rows = rpc_resp.json() or []
 
-        # Last 3 messages by recency (chronological order)
-        recent_res = (
-            sb.table("conversation_history")
-            .select("role,content,created_at")
-            .order("created_at", desc=True)
-            .limit(3)
-            .execute()
-        )
-        recent_rows = list(reversed(recent_res.data or []))
+            # Last 3 messages by recency
+            recent_resp = await client.get(
+                sb_url("/rest/v1/conversation_history"),
+                headers=sb_headers(),
+                params={"select": "role,content,created_at", "order": "created_at.desc", "limit": "3"},
+                timeout=10,
+            )
+            recent_resp.raise_for_status()
+            recent_rows = list(reversed(recent_resp.json() or []))
 
         # Merge: prioritise recent, backfill with semantic hits
         seen = {r["content"] for r in recent_rows}

@@ -1,7 +1,7 @@
 """
-knowledge_graph.py — Knowledge graph backed by Supabase (knowledge_nodes table).
+knowledge_graph.py — Knowledge graph backed by Supabase via direct REST API calls.
 
-Table schema (create once in Supabase dashboard):
+Table schema (create once in Supabase dashboard — see supabase_client.SETUP_SQL):
     id          uuid PRIMARY KEY DEFAULT gen_random_uuid()
     domain      text NOT NULL
     topic       text NOT NULL
@@ -17,7 +17,9 @@ import re
 from datetime import datetime, timezone
 from typing import Any
 
-from supabase_client import get_supabase
+import httpx
+
+from supabase_client import sb_headers, sb_url
 
 logger = logging.getLogger(__name__)
 
@@ -29,9 +31,20 @@ def _sanitize(name: str) -> str:
 
 
 def _extract_summary(content: str) -> str:
-    """Pull the ## Summary section out of stored markdown content."""
     m = re.search(r"## Summary\n(.*?)(?=\n##|\Z)", content, re.DOTALL)
     return m.group(1).strip() if m else ""
+
+
+def _get(params: dict) -> list[dict]:
+    """GET /rest/v1/knowledge_nodes with query params. Returns list of rows."""
+    resp = httpx.get(
+        sb_url("/rest/v1/knowledge_nodes"),
+        headers=sb_headers(),
+        params=params,
+        timeout=10,
+    )
+    resp.raise_for_status()
+    return resp.json()
 
 
 # ---------------------------------------------------------------------------
@@ -40,28 +53,13 @@ def _extract_summary(content: str) -> str:
 
 def update_knowledge_graph(kg_update: dict[str, Any]) -> None:
     """
-    Upsert topics from a Claude KG update dict into Supabase.
-
-    Expected shape:
-    {
-        "topics": [
-            {
-                "domain": "physics",
-                "topic": "thermodynamics",
-                "bloom_level": 3,
-                "summary": "Laws of heat, energy, and entropy",
-                "edges": [{"type": "prerequisite", "target": "classical mechanics"}],
-                "vocab": ["entropy", "enthalpy"]
-            }
-        ]
-    }
+    Upsert topics from a Claude KG update dict into Supabase via REST API.
     """
     topics = kg_update.get("topics", [])
     if not topics:
         logger.debug("No topics in KG update, skipping.")
         return
 
-    sb = get_supabase()
     now = datetime.now(tz=timezone.utc).isoformat()
 
     for t in topics:
@@ -75,25 +73,21 @@ def update_knowledge_graph(kg_update: dict[str, Any]) -> None:
         # Fetch existing content to preserve history
         existing_history = ""
         try:
-            res = (
-                sb.table("knowledge_nodes")
-                .select("content")
-                .eq("domain", domain)
-                .eq("topic", topic)
-                .maybe_single()
-                .execute()
-            )
-            if res.data:
-                old_content = res.data.get("content", "")
-                history_match = re.search(r"## History\n(.*)", old_content, re.DOTALL)
-                if history_match:
-                    existing_history = history_match.group(1).strip()
+            rows = _get({
+                "select": "content",
+                "domain": f"eq.{domain}",
+                "topic": f"eq.{topic}",
+                "limit": "1",
+            })
+            if rows:
+                old_content = rows[0].get("content", "")
+                m = re.search(r"## History\n(.*)", old_content, re.DOTALL)
+                if m:
+                    existing_history = m.group(1).strip()
         except Exception as e:
             logger.warning("Could not fetch existing node for history: %s", e)
 
-        edges_md = "\n".join(
-            f"- {e.get('type', 'related')}: {e.get('target', '')}" for e in edges
-        )
+        edges_md = "\n".join(f"- {e.get('type', 'related')}: {e.get('target', '')}" for e in edges)
         vocab_md = "\n".join(f"- {v}" for v in vocab)
         now_str = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         history_entry = f"- {now_str}: bloom_score updated to {bloom_level}"
@@ -128,7 +122,14 @@ last_updated: {now_str}
         }
 
         try:
-            sb.table("knowledge_nodes").upsert(row, on_conflict="domain,topic").execute()
+            resp = httpx.post(
+                sb_url("/rest/v1/knowledge_nodes"),
+                headers=sb_headers(prefer="resolution=merge-duplicates"),
+                params={"on_conflict": "domain,topic"},
+                content=json.dumps(row),
+                timeout=10,
+            )
+            resp.raise_for_status()
             logger.info("Upserted knowledge node: %s / %s (bloom %d)", domain, topic, bloom_level)
         except Exception as e:
             logger.error("Failed to upsert knowledge node %s/%s: %s", domain, topic, e)
@@ -141,21 +142,12 @@ last_updated: {now_str}
 def get_selective_context(user_message: str, max_tokens: int = 500) -> str:
     """
     Return knowledge-graph context relevant to the user's message.
-
-    Strategy:
-    - Fetch all topics from Supabase.
-    - Keyword-match user message against topic names.
-    - Include the single most relevant topic in full (content field).
-    - Include remaining matched topics as one-line summaries.
-    - Cap total output at max_tokens (approximate).
+    Keyword-matches against topic names; primary topic in full, rest as one-liners.
     """
     max_chars = max_tokens * _CHARS_PER_TOKEN
 
     try:
-        res = get_supabase().table("knowledge_nodes").select(
-            "domain,topic,bloom_score,content"
-        ).execute()
-        rows = res.data or []
+        rows = _get({"select": "domain,topic,bloom_score,content"})
     except Exception as e:
         logger.warning("Failed to fetch knowledge nodes: %s", e)
         return "No knowledge graph yet."
@@ -163,7 +155,6 @@ def get_selective_context(user_message: str, max_tokens: int = 500) -> str:
     if not rows:
         return "No knowledge graph yet."
 
-    # Keyword scoring
     message_words = set(w.lower() for w in re.split(r"\W+", user_message) if len(w) > 3)
     scored: list[tuple[int, dict]] = []
     for row in rows:
@@ -177,18 +168,14 @@ def get_selective_context(user_message: str, max_tokens: int = 500) -> str:
     sections: list[str] = []
     chars_used = 0
 
-    # Primary topic: full content
     primary_list = matched if matched else scored
     if primary_list:
         _, primary = primary_list[0]
-        full_text = primary.get("content") or (
-            f"Topic: {primary['topic']} (bloom {primary['bloom_score']})"
-        )
+        full_text = primary.get("content") or f"Topic: {primary['topic']} (bloom {primary['bloom_score']})"
         if chars_used + len(full_text) <= max_chars:
             sections.append(f"### {primary['topic']} (full)\n{full_text}")
             chars_used += len(full_text)
 
-    # Remaining: one-liners
     remaining = (matched[1:] if matched else []) + [(s, r) for s, r in scored if s == 0]
     for _, row in remaining:
         summary = _extract_summary(row.get("content", ""))
@@ -206,16 +193,9 @@ def get_selective_context(user_message: str, max_tokens: int = 500) -> str:
 # ---------------------------------------------------------------------------
 
 def get_all_topics() -> list[dict[str, Any]]:
-    """Return all knowledge nodes from Supabase, sorted by updated_at desc."""
+    """Return all knowledge nodes sorted by updated_at desc."""
     try:
-        res = (
-            get_supabase()
-            .table("knowledge_nodes")
-            .select("*")
-            .order("updated_at", desc=True)
-            .execute()
-        )
-        rows = res.data or []
+        rows = _get({"select": "*", "order": "updated_at.desc"})
     except Exception as e:
         logger.error("Failed to fetch all topics: %s", e)
         return []
@@ -223,7 +203,6 @@ def get_all_topics() -> list[dict[str, Any]]:
     results = []
     for row in rows:
         content = row.get("content", "")
-        summary = _extract_summary(content)
         results.append({
             "id": f"{row['domain']}/{row['topic']}",
             "title": row["topic"].title(),
@@ -231,7 +210,7 @@ def get_all_topics() -> list[dict[str, Any]]:
             "domain": row["domain"],
             "bloom_level": row.get("bloom_score", 0),
             "last_updated": row.get("updated_at", ""),
-            "summary": summary,
+            "summary": _extract_summary(content),
             "raw": content,
             "edges": row.get("edges") or [],
         })
@@ -239,16 +218,9 @@ def get_all_topics() -> list[dict[str, Any]]:
 
 
 def get_knowledge_index_markdown() -> str:
-    """Build an index markdown string from all Supabase nodes."""
+    """Build an index markdown string from all nodes."""
     try:
-        res = (
-            get_supabase()
-            .table("knowledge_nodes")
-            .select("domain,topic,bloom_score,content")
-            .order("domain")
-            .execute()
-        )
-        rows = res.data or []
+        rows = _get({"select": "domain,topic,bloom_score,content", "order": "domain"})
     except Exception as e:
         logger.error("Failed to fetch knowledge index: %s", e)
         return "(error fetching knowledge graph)"
@@ -264,10 +236,7 @@ def get_knowledge_index_markdown() -> str:
             current_domain = row["domain"]
             lines.append(f"\n## {current_domain.title()}\n")
         summary = _extract_summary(row.get("content", ""))
-        lines.append(
-            f"- **{row['topic'].title()}** (bloom:{row['bloom_score']}) -- {summary}"
-        )
-
+        lines.append(f"- **{row['topic'].title()}** (bloom:{row['bloom_score']}) -- {summary}")
     return "\n".join(lines)
 
 

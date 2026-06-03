@@ -1,14 +1,13 @@
 """
-supabase_client.py — Singleton Supabase client and table bootstrap.
+supabase_client.py — Thin helpers for direct Supabase REST API access via httpx.
+No supabase-py library required.
 """
 import logging
 import os
 
-from supabase import Client, create_client
+import httpx
 
 logger = logging.getLogger(__name__)
-
-_client: Client | None = None
 
 SETUP_SQL = """
 -- Run this once in the Supabase dashboard SQL editor:
@@ -49,11 +48,8 @@ RETURNS TABLE(role text, content text, created_at timestamptz, similarity float)
 LANGUAGE plpgsql AS $$
 BEGIN
     RETURN QUERY
-    SELECT
-        ch.role,
-        ch.content,
-        ch.created_at,
-        1 - (ch.embedding <=> query_embedding) AS similarity
+    SELECT ch.role, ch.content, ch.created_at,
+           1 - (ch.embedding <=> query_embedding) AS similarity
     FROM conversation_history ch
     ORDER BY ch.embedding <=> query_embedding
     LIMIT match_count;
@@ -62,35 +58,46 @@ $$;
 """
 
 
-def get_supabase() -> Client:
-    global _client
-    if _client is None:
-        _client = create_client(
-            os.environ["SUPABASE_URL"],
-            os.environ["SUPABASE_ANON_KEY"],
-        )
-    return _client
+def sb_url(path: str) -> str:
+    """Build a full Supabase REST URL. path should start with /rest/v1/..."""
+    base = os.environ["SUPABASE_URL"].rstrip("/")
+    return f"{base}{path}"
+
+
+def sb_headers(prefer: str | None = None) -> dict[str, str]:
+    """Return standard Supabase REST headers."""
+    key = os.environ["SUPABASE_ANON_KEY"]
+    h = {
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+    }
+    if prefer:
+        h["Prefer"] = prefer
+    return h
 
 
 def ensure_table_exists() -> None:
     """
-    Verify both required tables are reachable on startup.
-    If either is missing, log the full setup SQL and raise.
+    Verify both required tables are reachable on startup via the REST API.
+    Logs the full setup SQL and raises if either table is missing.
     """
-    sb = get_supabase()
     errors = []
-
     for table in ("knowledge_nodes", "conversation_history"):
+        url = sb_url(f"/rest/v1/{table}?select=id&limit=1")
         try:
-            sb.table(table).select("id").limit(1).execute()
-            logger.info("Table '%s' verified.", table)
+            resp = httpx.get(url, headers=sb_headers(), timeout=10)
+            if resp.status_code >= 400:
+                errors.append(f"{table}: HTTP {resp.status_code} — {resp.text[:120]}")
+            else:
+                logger.info("Table '%s' verified.", table)
         except Exception as e:
             errors.append(f"{table}: {e}")
 
     if errors:
         logger.error(
-            "Missing Supabase tables: %s\nRun the following SQL in the Supabase dashboard:\n%s",
-            errors,
-            SETUP_SQL,
+            "Missing or unreachable Supabase tables: %s\n"
+            "Run the following SQL in the Supabase dashboard:\n%s",
+            errors, SETUP_SQL,
         )
         raise RuntimeError(f"Supabase setup incomplete: {errors}")
