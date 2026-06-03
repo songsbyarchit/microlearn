@@ -108,7 +108,7 @@ async def _elevenlabs_tts(text: str, api_key: str) -> bytes:
         "voice_settings": {
             "stability": 0.4,
             "similarity_boost": 0.8,
-            "speaking_rate": 1.25,
+            "speaking_rate": 1.4,
         },
     }
     async with httpx.AsyncClient() as client:
