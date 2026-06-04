@@ -39,7 +39,7 @@ IMMEDIATE_COMMANDS = {"reply", "r"}
 SETTINGS_COMMANDS = {
     "faster", "slower", "american", "british", "shorter", "longer",
     "simpler", "deeper", "recap on", "recap off", "settings", "graph",
-    "test me", "report",
+    "test me", "report", "pdf report",
 }
 
 # ---------------------------------------------------------------------------
@@ -564,6 +564,37 @@ async def _handle_report(sender: str) -> None:
             logger.error("Failed to send report to %s: %s", sender, resp.text)
 
 
+async def _handle_pdf_report(sender: str) -> None:
+    """Generate a detailed 7-day deep-dive PDF and send immediately."""
+    await _send_text_now(sender, "Generating your deep-dive report, this may take a moment…")
+    try:
+        from report import generate_detailed_pdf
+        url = await generate_detailed_pdf(7)
+    except Exception as e:
+        logger.error("Detailed PDF generation failed: %s", e)
+        await _send_text_now(sender, "Report generation failed — try again later.")
+        return
+
+    if not url:
+        await _send_text_now(sender, "No data yet — keep learning!")
+        return
+
+    twilio_sid = os.environ["TWILIO_ACCOUNT_SID"]
+    twilio_token = os.environ["TWILIO_AUTH_TOKEN"]
+    from_number = os.environ["TWILIO_WHATSAPP_NUMBER"]
+    messages_url = f"https://api.twilio.com/2010-04-01/Accounts/{twilio_sid}/Messages.json"
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            messages_url,
+            data={"From": from_number, "To": sender, "MediaUrl": url, "Body": "Your 7-day deep dive 📖"},
+            auth=(twilio_sid, twilio_token),
+            timeout=15,
+        )
+        if resp.status_code >= 400:
+            logger.error("Failed to send detailed PDF to %s: %s", sender, resp.text)
+
+
 async def _handle_settings_command(sender: str, cmd: str) -> None:
     """Mutate user settings or respond to info commands."""
     settings = get_settings(sender)
@@ -638,6 +669,9 @@ async def _handle_settings_command(sender: str, cmd: str) -> None:
 
     elif cmd == "report":
         await _handle_report(sender)
+
+    elif cmd == "pdf report":
+        await _handle_pdf_report(sender)
 
 
 @app.post("/webhook")
