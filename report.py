@@ -246,8 +246,11 @@ async def _screenshot(html: str) -> bytes:
     from playwright.async_api import async_playwright
     async with async_playwright() as p:
         browser = await p.chromium.launch()
-        page = await browser.new_page()
-        await page.set_viewport_size({"width": 1080, "height": 1920})
+        context = await browser.new_context(
+            viewport={"width": 1080, "height": 1920},
+            device_scale_factor=3,
+        )
+        page = await context.new_page()
         await page.set_content(html, wait_until="networkidle")
         png_bytes = await page.screenshot(full_page=True)
         await browser.close()
