@@ -101,8 +101,8 @@ async def check_and_send_daily_report() -> None:
         logger.info("No transcripts today, skipping daily report.")
         return
 
-    from report import generate_report_pdf
-    url, stats = await generate_report_pdf(1)
+    from report import generate_report_image
+    url, stats = await generate_report_image(1)
 
     if not url:
         logger.info("Report generation returned empty, skipping send.")

@@ -56,9 +56,9 @@ def clean_for_text(text: str) -> str:
 # Cloudflare R2 upload
 # ---------------------------------------------------------------------------
 
-def _r2_upload_sync(audio_bytes: bytes, filename: str) -> str:
+def _r2_upload_sync(data: bytes, filename: str, content_type: str = "audio/mpeg") -> str:
     """
-    Upload MP3 bytes to Cloudflare R2 (S3-compatible) and return the public URL.
+    Upload bytes to Cloudflare R2 (S3-compatible) and return the public URL.
     Runs synchronously; call via asyncio.to_thread to avoid blocking the event loop.
     """
     s3 = boto3.client(
@@ -72,8 +72,8 @@ def _r2_upload_sync(audio_bytes: bytes, filename: str) -> str:
     s3.put_object(
         Bucket=bucket,
         Key=filename,
-        Body=audio_bytes,
-        ContentType="audio/mpeg",
+        Body=data,
+        ContentType=content_type,
     )
     public_url = os.environ["R2_PUBLIC_URL"].rstrip("/")
     return f"{public_url}/{filename}"

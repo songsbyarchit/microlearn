@@ -457,8 +457,8 @@ async def _handle_test_me(sender: str) -> None:
 async def _handle_report(sender: str) -> None:
     """Generate a 7-day PDF report and send immediately."""
     try:
-        from report import generate_report_pdf
-        url, _stats = await generate_report_pdf(7)
+        from report import generate_report_image
+        url, _stats = await generate_report_image(7)
     except Exception as e:
         logger.error("Report generation failed: %s", e)
         await _send_text_now(sender, "No data yet — keep learning!")
