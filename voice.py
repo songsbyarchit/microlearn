@@ -25,15 +25,27 @@ ELEVENLABS_API_URL = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_V
 # Text post-processing
 # ---------------------------------------------------------------------------
 
+def strip_markdown(text: str) -> str:
+    """Remove markdown formatting before sending to TTS."""
+    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
+    text = re.sub(r"\*(.+?)\*", r"\1", text)
+    text = re.sub(r"__(.+?)__", r"\1", text)
+    text = re.sub(r"_(.+?)_", r"\1", text)
+    text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
+    return text.strip()
+
+
 def post_process_for_tts(text: str) -> str:
-    """Replace [pause] / [long pause] markers with SSML break tags for ElevenLabs."""
+    """Strip markdown, then replace [pause] / [long pause] markers with SSML break tags for ElevenLabs."""
+    text = strip_markdown(text)
     text = text.replace("[long pause]", '<break time="0.9s"/>')
     text = text.replace("[pause]", '<break time="0.5s"/>')
     return text.strip()
 
 
 def clean_for_text(text: str) -> str:
-    """Strip pause markers before sending a plain-text WhatsApp message."""
+    """Strip markdown and pause markers before sending a plain-text WhatsApp message."""
+    text = strip_markdown(text)
     text = text.replace("[long pause]", "")
     text = text.replace("[pause]", "")
     text = re.sub(r"  +", " ", text)
@@ -132,7 +144,7 @@ async def _elevenlabs_tts(text: str, api_key: str) -> bytes:
         "voice_settings": {
             "stability": 0.4,
             "similarity_boost": 0.8,
-            "speaking_rate": 1.4,
+            "speaking_rate": 1.6,
         },
     }
     async with httpx.AsyncClient() as client:

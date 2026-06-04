@@ -355,23 +355,10 @@ async def knowledge_viewer():
 # ---------------------------------------------------------------------------
 
 async def _send_reaction(to: str, emoji: str) -> None:
-    """Send a single emoji as a quick acknowledgement message."""
-    messages_url = f"https://api.twilio.com/2010-04-01/Accounts/{os.environ['TWILIO_ACCOUNT_SID']}/Messages.json"
-    try:
-        async with httpx.AsyncClient() as client:
-            await client.post(
-                messages_url,
-                data={
-                    "From": os.environ["TWILIO_WHATSAPP_NUMBER"],
-                    "To": to,
-                    "Body": emoji,
-                },
-                auth=(os.environ["TWILIO_ACCOUNT_SID"], os.environ["TWILIO_AUTH_TOKEN"]),
-                timeout=10,
-            )
-        logger.info("Sent reaction %s to %s", emoji, to)
-    except Exception as e:
-        logger.warning("Failed to send reaction %s: %s", emoji, e)
+    """No-op: Twilio sandbox does not support native WhatsApp reactions.
+    Sending standalone emoji messages is worse than nothing, so we suppress them.
+    """
+    logger.debug("Reaction %s suppressed (not supported in Twilio sandbox)", emoji)
 
 
 @app.post("/webhook")
