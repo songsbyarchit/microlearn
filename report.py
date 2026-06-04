@@ -1,32 +1,19 @@
 """
-report.py — Generate a dark-background PNG report card and upload to Cloudflare R2.
+report.py — Generate a dark-themed HTML report, screenshot via Playwright, upload to R2.
 """
 import asyncio
-import io
 import logging
-import os
 import re
 import uuid
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 
 import httpx
-from PIL import Image, ImageDraw, ImageFont
 
 from supabase_client import sb_headers, sb_url
 from voice import _r2_upload_sync
 
 logger = logging.getLogger(__name__)
-
-# ── Canvas & palette ──────────────────────────────────────────────────────────
-W, H   = 720, 1080
-BG     = (26, 26, 46)       # #1a1a2e
-ACCENT = (79, 195, 247)     # #4fc3f7
-WHITE  = (255, 255, 255)
-DIM    = (120, 130, 160)
-RULE   = (45, 50, 80)
-BAR_BG = (40, 45, 75)
-PAD    = 44
 
 STOP_WORDS = {
     "the", "and", "for", "that", "this", "with", "have", "from", "they",
@@ -39,36 +26,9 @@ STOP_WORDS = {
 FILLER_WORDS = ["basically", "like", "sort of", "kind of", "you know", "literally"]
 
 
-# ── Fonts ─────────────────────────────────────────────────────────────────────
-
-def _load_fonts() -> dict:
-    candidates = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/dejavu/DejaVuSans.ttf",
-    ]
-    reg  = next((p for p in candidates if os.path.exists(p) and "Bold" not in p), None)
-    bold = next((p for p in candidates if os.path.exists(p) and "Bold" in p), None)
-    try:
-        if not reg and not bold:
-            raise OSError("no system fonts found")
-        return {
-            "title":   ImageFont.truetype(bold or reg, 34),
-            "section": ImageFont.truetype(bold or reg, 15),
-            "body":    ImageFont.truetype(reg  or bold, 18),
-            "small":   ImageFont.truetype(reg  or bold, 13),
-        }
-    except Exception:
-        return {
-            "title":   ImageFont.load_default(size=34),
-            "section": ImageFont.load_default(size=15),
-            "body":    ImageFont.load_default(size=18),
-            "small":   ImageFont.load_default(size=13),
-        }
-
-
-# ── Supabase fetches ──────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Supabase fetches
+# ---------------------------------------------------------------------------
 
 def _fetch_transcripts(days: int) -> list[dict]:
     since = (datetime.now(tz=timezone.utc) - timedelta(days=days)).isoformat()
@@ -110,7 +70,9 @@ def _fetch_nodes(days: int) -> list[dict]:
         return []
 
 
-# ── Analysis helpers ──────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Analysis helpers
+# ---------------------------------------------------------------------------
 
 def _top_words(texts: list[str], n: int = 5) -> list[tuple[str, int]]:
     words = []
@@ -126,50 +88,12 @@ def _count_fillers(texts: list[str]) -> dict[str, int]:
     return {f: combined.count(f) for f in FILLER_WORDS if combined.count(f) > 0}
 
 
-# ── Drawing helpers ───────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# HTML builder
+# ---------------------------------------------------------------------------
 
-def _section_header(draw: ImageDraw.ImageDraw, fonts: dict, y: int, label: str) -> int:
-    """Draw an accent-bar section heading. Returns new y."""
-    draw.rectangle([PAD, y, PAD + 3, y + 20], fill=ACCENT)
-    draw.text((PAD + 14, y + 2), label, font=fonts["section"], fill=ACCENT)
-    return y + 32
-
-
-def _draw_bar_chart(
-    draw: ImageDraw.ImageDraw,
-    fonts: dict,
-    top_words: list[tuple[str, int]],
-    x: int, y: int, width: int,
-) -> int:
-    """Draw horizontal bars for top words. Returns new y."""
-    if not top_words:
-        draw.text((x, y), "Not enough data", font=fonts["small"], fill=DIM)
-        return y + 22
-
-    max_count = top_words[0][1] or 1
-    label_w = 140
-    count_w = 36
-    bar_w   = width - label_w - count_w - 12
-    bar_h   = 18
-    gap     = 9
-
-    for word, count in top_words:
-        draw.text((x, y + 2), word, font=fonts["small"], fill=WHITE)
-        draw.rectangle([x + label_w, y, x + label_w + bar_w, y + bar_h], fill=BAR_BG)
-        fill_px = max(4, int(bar_w * count / max_count))
-        draw.rectangle([x + label_w, y, x + label_w + fill_px, y + bar_h], fill=ACCENT)
-        draw.text((x + label_w + bar_w + 8, y + 2), str(count), font=fonts["small"], fill=DIM)
-        y += bar_h + gap
-    return y
-
-
-# ── Image builder ─────────────────────────────────────────────────────────────
-
-def _build_image(transcripts: list[dict], nodes: list[dict]) -> bytes:
-    img   = Image.new("RGB", (W, H), BG)
-    draw  = ImageDraw.Draw(img)
-    fonts = _load_fonts()
-
+def _build_html(transcripts: list[dict], nodes: list[dict], days: int) -> str:
+    date_label  = datetime.now(tz=timezone.utc).strftime("%d %B %Y")
     total_msgs  = len(transcripts)
     voice_count = sum(1 for t in transcripts if t.get("is_voice_note"))
     text_count  = total_msgs - voice_count
@@ -178,76 +102,161 @@ def _build_image(transcripts: list[dict], nodes: list[dict]) -> bytes:
     top_words   = _top_words(texts)
     fillers     = _count_fillers(texts)
     top_nodes   = nodes[:5]
+    timestamp   = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-    y = 44
+    # Bar chart rows
+    bar_max = top_words[0][1] if top_words else 1
+    bar_chart_html = "".join(
+        f'<div class="bar-row">'
+        f'<div class="bar-label">{w}</div>'
+        f'<div class="bar-track">'
+        f'<div class="bar-fill" style="width:{int(c / bar_max * 100)}%"></div>'
+        f'</div>'
+        f'<div class="bar-count">{c}</div>'
+        f'</div>'
+        for w, c in top_words
+    ) or '<p class="empty">Not enough data</p>'
 
-    # ── Header ──────────────────────────────────────────────────────────────
-    draw.text((PAD, y), "MicroLearn", font=fonts["title"], fill=ACCENT)
-    y += 46
-    date_str = datetime.now(tz=timezone.utc).strftime("%d %B %Y")
-    draw.text((PAD, y), f"7 Day Report  ·  {date_str}", font=fonts["body"], fill=DIM)
-    y += 36
-    draw.rectangle([PAD, y, W - PAD, y + 1], fill=RULE)
-    y += 22
+    # Topics
+    topics_html = "".join(
+        f'<div class="topic-row">'
+        f'<span class="topic-name">· {n["topic"].title()}</span>'
+        f'<span class="topic-meta">{n["domain"]} &nbsp;·&nbsp; bloom {n.get("bloom_score", 0)}</span>'
+        f'</div>'
+        for n in top_nodes
+    ) or '<p class="empty">No topics yet</p>'
 
-    # ── MESSAGES ────────────────────────────────────────────────────────────
-    y = _section_header(draw, fonts, y, "MESSAGES")
-    draw.text(
-        (PAD + 14, y),
-        f"{total_msgs} total  ·  {voice_count} voice  ·  {text_count} text",
-        font=fonts["body"], fill=WHITE,
-    )
-    y += 36
-    draw.rectangle([PAD, y, W - PAD, y + 1], fill=RULE)
-    y += 22
+    # Filler words
+    fillers_html = "".join(
+        f'<div class="filler-row">'
+        f'<span class="filler-word">{f}</span>'
+        f'<span class="filler-count">×{c}</span>'
+        f'</div>'
+        for f, c in fillers.items()
+    ) or '<p class="empty">None detected — clean speech!</p>'
 
-    # ── SPEECH ──────────────────────────────────────────────────────────────
-    y = _section_header(draw, fonts, y, "SPEECH")
-    draw.text((PAD + 14, y), f"{total_words:,} words spoken", font=fonts["body"], fill=WHITE)
-    y += 34
-    y = _draw_bar_chart(draw, fonts, top_words, PAD + 14, y, W - PAD * 2 - 14)
-    y += 14
-    draw.rectangle([PAD, y, W - PAD, y + 1], fill=RULE)
-    y += 22
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=1080">
+<style>
+  *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{
+    background: #1a1a2e;
+    color: #ffffff;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
+    padding: 72px 80px 80px;
+    min-width: 1080px;
+    max-width: 1080px;
+  }}
 
-    # ── TOPICS ──────────────────────────────────────────────────────────────
-    y = _section_header(draw, fonts, y, "TOPICS")
-    if top_nodes:
-        for node in top_nodes:
-            topic  = node["topic"].title()
-            domain = node["domain"]
-            bloom  = node.get("bloom_score", 0)
-            draw.text((PAD + 14, y), f"·  {topic}", font=fonts["body"], fill=WHITE)
-            draw.text((PAD + 300, y), f"{domain}  bloom {bloom}", font=fonts["small"], fill=DIM)
-            y += 30
-    else:
-        draw.text((PAD + 14, y), "No topics yet", font=fonts["body"], fill=DIM)
-        y += 30
-    y += 8
-    draw.rectangle([PAD, y, W - PAD, y + 1], fill=RULE)
-    y += 22
+  h1 {{ font-size: 48px; font-weight: 800; color: #4fc3f7; letter-spacing: -1px; line-height: 1; }}
+  .subtitle {{ font-size: 20px; color: #6b7a99; margin-top: 10px; margin-bottom: 48px; }}
 
-    # ── FILLER WORDS ────────────────────────────────────────────────────────
-    y = _section_header(draw, fonts, y, "FILLER WORDS")
-    if fillers:
-        for filler, count in fillers.items():
-            draw.text((PAD + 14, y), filler, font=fonts["body"], fill=WHITE)
-            draw.text((PAD + 250, y), f"×{count}", font=fonts["body"], fill=ACCENT)
-            y += 30
-    else:
-        draw.text((PAD + 14, y), "None detected — clean speech!", font=fonts["body"], fill=DIM)
+  .section {{ margin-bottom: 52px; }}
+  .section-label {{
+    font-size: 11px; font-weight: 700; letter-spacing: 0.15em;
+    text-transform: uppercase; color: #4fc3f7;
+    border-left: 4px solid #4fc3f7; padding-left: 14px;
+    margin-bottom: 20px;
+  }}
 
-    # ── Footer ──────────────────────────────────────────────────────────────
-    ts = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    draw.rectangle([PAD, H - 52, W - PAD, H - 51], fill=RULE)
-    draw.text((PAD, H - 38), f"Generated by MicroLearn  ·  {ts}", font=fonts["small"], fill=DIM)
+  .stat-row {{ display: flex; gap: 20px; }}
+  .stat-box {{
+    background: #1e2240; border-left: 3px solid #4fc3f7;
+    padding: 20px 26px; border-radius: 8px; flex: 1;
+  }}
+  .stat-box .n {{ font-size: 42px; font-weight: 800; color: #4fc3f7; line-height: 1; }}
+  .stat-box .l {{ font-size: 14px; color: #6b7a99; margin-top: 6px; }}
 
-    buf = io.BytesIO()
-    img.save(buf, format="PNG", optimize=True)
-    return buf.getvalue()
+  .words-spoken {{ font-size: 26px; color: #fff; margin-bottom: 24px; font-weight: 600; }}
+
+  .bar-row {{ display: flex; align-items: center; gap: 14px; margin-bottom: 12px; }}
+  .bar-label {{ font-size: 15px; color: #cbd5e1; width: 150px; flex-shrink: 0; }}
+  .bar-track {{ flex: 1; height: 20px; background: #252a4a; border-radius: 4px; overflow: hidden; }}
+  .bar-fill {{ height: 100%; background: #4fc3f7; border-radius: 4px; }}
+  .bar-count {{ font-size: 14px; color: #6b7a99; width: 40px; text-align: right; flex-shrink: 0; }}
+
+  .topic-row {{
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 12px 0; border-bottom: 1px solid #1e2240;
+  }}
+  .topic-row:last-child {{ border-bottom: none; }}
+  .topic-name {{ font-size: 18px; color: #fff; }}
+  .topic-meta {{ font-size: 14px; color: #6b7a99; }}
+
+  .filler-row {{
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 10px 0; border-bottom: 1px solid #1e2240;
+  }}
+  .filler-row:last-child {{ border-bottom: none; }}
+  .filler-word {{ font-size: 17px; color: #fff; }}
+  .filler-count {{ font-size: 17px; color: #4fc3f7; font-weight: 700; }}
+
+  .empty {{ font-size: 16px; color: #3d4565; font-style: italic; }}
+
+  .footer {{
+    margin-top: 56px; font-size: 13px; color: #3d4565;
+    border-top: 1px solid #252a4a; padding-top: 20px;
+  }}
+</style>
+</head>
+<body>
+
+<h1>MicroLearn</h1>
+<div class="subtitle">7 Day Report &nbsp;·&nbsp; {date_label}</div>
+
+<div class="section">
+  <div class="section-label">Messages</div>
+  <div class="stat-row">
+    <div class="stat-box"><div class="n">{total_msgs}</div><div class="l">total</div></div>
+    <div class="stat-box"><div class="n">{voice_count}</div><div class="l">voice notes</div></div>
+    <div class="stat-box"><div class="n">{text_count}</div><div class="l">text messages</div></div>
+  </div>
+</div>
+
+<div class="section">
+  <div class="section-label">Speech</div>
+  <div class="words-spoken">{total_words:,} words spoken</div>
+  {bar_chart_html}
+</div>
+
+<div class="section">
+  <div class="section-label">Topics</div>
+  {topics_html}
+</div>
+
+<div class="section">
+  <div class="section-label">Filler Words</div>
+  {fillers_html}
+</div>
+
+<div class="footer">Generated by MicroLearn &nbsp;·&nbsp; {timestamp}</div>
+
+</body>
+</html>"""
 
 
-# ── Main entry point ──────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Screenshot via Playwright
+# ---------------------------------------------------------------------------
+
+async def _screenshot(html: str) -> bytes:
+    from playwright.async_api import async_playwright
+    async with async_playwright() as p:
+        browser = await p.chromium.launch()
+        page = await browser.new_page()
+        await page.set_viewport_size({"width": 1080, "height": 1920})
+        await page.set_content(html, wait_until="networkidle")
+        png_bytes = await page.screenshot(full_page=True)
+        await browser.close()
+    return png_bytes
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
 
 async def generate_report_image(days: int = 7) -> tuple[str, dict]:
     """
@@ -260,10 +269,12 @@ async def generate_report_image(days: int = 7) -> tuple[str, dict]:
     if not transcripts and not nodes:
         return "", {}
 
+    html = _build_html(transcripts, nodes, days)
+
     try:
-        png_bytes = await asyncio.to_thread(_build_image, transcripts, nodes)
+        png_bytes = await _screenshot(html)
     except Exception as e:
-        logger.error("Image generation failed: %s", e)
+        logger.error("Playwright screenshot failed: %s", e)
         return "", {}
 
     date_str = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
