@@ -141,7 +141,116 @@ async def check_and_send_daily_report() -> None:
     logger.info("Daily report sent for %s.", today)
 
 
+async def check_and_send_morning_recall() -> None:
+    """Send 3 morning recall questions at 08:00 UK time. No-op at all other times."""
+    uk_tz = pytz.timezone("Europe/London")
+    now_uk = datetime.now(tz=uk_tz)
+
+    if now_uk.hour != 8:
+        return
+
+    redis = Redis(
+        url=os.environ["UPSTASH_REDIS_REST_URL"],
+        token=os.environ["UPSTASH_REDIS_REST_TOKEN"],
+    )
+    today = now_uk.strftime("%Y-%m-%d")
+    last_date = redis.get("microlearn:last_recall_date")
+    if last_date and last_date.strip('"') == today:
+        logger.info("Morning recall already sent for %s.", today)
+        return
+
+    my_number = os.environ.get("MY_WHATSAPP_NUMBER", "")
+    if not my_number:
+        logger.warning("MY_WHATSAPP_NUMBER not set, cannot send morning recall.")
+        return
+
+    now_utc = datetime.now(tz=timezone.utc)
+
+    def _fetch_node_for_window(days_ago: int) -> dict | None:
+        """Fetch lowest-bloom-score node updated roughly `days_ago` days ago."""
+        from datetime import timedelta
+        half = max(1, days_ago // 2)
+        since = (now_utc - timedelta(days=days_ago + half)).isoformat()
+        until = (now_utc - timedelta(days=max(0, days_ago - half))).isoformat()
+        try:
+            resp = httpx.get(
+                sb_url("/rest/v1/knowledge_nodes"),
+                headers=sb_headers(),
+                params=[
+                    ("select", "domain,topic,bloom_score,content"),
+                    ("updated_at", f"gte.{since}"),
+                    ("updated_at", f"lte.{until}"),
+                    ("order", "bloom_score.asc"),
+                    ("limit", "1"),
+                ],
+                timeout=10,
+            )
+            rows = resp.json() or []
+            return rows[0] if rows else None
+        except Exception as e:
+            logger.warning("Failed to fetch node for %d-day window: %s", days_ago, e)
+            return None
+
+    nodes = [_fetch_node_for_window(d) for d in (1, 3, 7)]
+    nodes = [n for n in nodes if n]  # drop empty windows
+
+    if not nodes:
+        logger.info("No nodes found for morning recall windows.")
+        return
+
+    from quiz import generate_question
+
+    questions = []
+    for node in nodes:
+        try:
+            q = await generate_question(node["topic"], node["domain"], node.get("content", ""))
+            questions.append(q)
+        except Exception as e:
+            logger.error("generate_question failed for %s: %s", node["topic"], e)
+
+    if not questions:
+        logger.info("No questions generated for morning recall.")
+        return
+
+    twilio_sid = os.environ["TWILIO_ACCOUNT_SID"]
+    twilio_token = os.environ["TWILIO_AUTH_TOKEN"]
+    from_number = os.environ["TWILIO_WHATSAPP_NUMBER"]
+    messages_url = f"https://api.twilio.com/2010-04-01/Accounts/{twilio_sid}/Messages.json"
+
+    # Send all questions as separate WhatsApp messages
+    async with httpx.AsyncClient() as client:
+        for q in questions:
+            opts = q["options"]
+            body = (
+                f"Morning recall \U0001f9e0\n\n"
+                f"{q['question']}\n\n"
+                f"1. {opts[0]}\n"
+                f"2. {opts[1]}\n"
+                f"3. {opts[2]}\n"
+                f"4. {opts[3]}"
+            )
+            resp = await client.post(
+                messages_url,
+                data={"From": from_number, "To": my_number, "Body": body},
+                auth=(twilio_sid, twilio_token),
+                timeout=15,
+            )
+            if resp.status_code >= 400:
+                logger.error("Failed to send morning recall message: %s", resp.text)
+
+    # Store first question as active quiz state; remainder go in pending queue
+    state = {
+        "state": "awaiting_answer",
+        "question": questions[0],
+        "pending": questions[1:],
+    }
+    redis.set(f"microlearn:quiz:{my_number}", json.dumps(state), ex=43200)  # 12h TTL
+    redis.set("microlearn:last_recall_date", json.dumps(today))
+    logger.info("Morning recall sent: %d questions for %s.", len(questions), today)
+
+
 async def run_worker() -> None:
+    await check_and_send_morning_recall()
     await check_and_send_daily_report()
 
     twilio_sid = os.environ["TWILIO_ACCOUNT_SID"]

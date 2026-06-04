@@ -7,7 +7,7 @@ import logging
 import os
 import random
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 
@@ -17,9 +17,10 @@ import httpx
 from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
-from brain import get_recall_question, get_reply
+from brain import get_reply
 from delay_queue import pop_next_reply, schedule_reply
 from knowledge_graph import get_all_topics
+from quiz import generate_question, get_quiz_topics, grade_answer
 from settings_manager import get_settings, save_settings
 from supabase_client import ensure_table_exists, sb_headers, sb_url
 from voice import clean_for_text, generate_and_upload_audio, transcribe_audio
@@ -404,54 +405,133 @@ async def _save_transcript(content: str, is_voice_note: bool) -> None:
         logger.warning("Failed to save transcript: %s", e)
 
 
+# ---------------------------------------------------------------------------
+# Quiz state helpers (Redis)
+# ---------------------------------------------------------------------------
+
+def _quiz_key(phone: str) -> str:
+    return f"microlearn:quiz:{phone}"
+
+
+def _get_quiz_state(phone: str) -> dict | None:
+    from upstash_redis import Redis
+    r = Redis(url=os.environ["UPSTASH_REDIS_REST_URL"], token=os.environ["UPSTASH_REDIS_REST_TOKEN"])
+    raw = r.get(_quiz_key(phone))
+    if not raw:
+        return None
+    try:
+        return json.loads(raw) if isinstance(raw, str) else raw
+    except Exception:
+        return None
+
+
+def _set_quiz_state(phone: str, state: dict) -> None:
+    from upstash_redis import Redis
+    r = Redis(url=os.environ["UPSTASH_REDIS_REST_URL"], token=os.environ["UPSTASH_REDIS_REST_TOKEN"])
+    r.set(_quiz_key(phone), json.dumps(state), ex=3600)  # 1-hour TTL
+
+
+def _clear_quiz_state(phone: str) -> None:
+    from upstash_redis import Redis
+    r = Redis(url=os.environ["UPSTASH_REDIS_REST_URL"], token=os.environ["UPSTASH_REDIS_REST_TOKEN"])
+    r.delete(_quiz_key(phone))
+
+
+# ---------------------------------------------------------------------------
+# Quiz flow
+# ---------------------------------------------------------------------------
+
 async def _handle_test_me(sender: str) -> None:
-    """Pick a knowledge node from 3-7 days ago and send a recall question."""
-    from_dt = (datetime.now(tz=timezone.utc) - timedelta(days=7)).isoformat()
-    to_dt = (datetime.now(tz=timezone.utc) - timedelta(days=3)).isoformat()
-    try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(
-                sb_url("/rest/v1/knowledge_nodes"),
-                headers=sb_headers(),
-                params=[
-                    ("select", "domain,topic,bloom_score,content"),
-                    ("updated_at", f"gte.{from_dt}"),
-                    ("updated_at", f"lte.{to_dt}"),
-                    ("limit", "10"),
-                ],
-                timeout=10,
-            )
-            resp.raise_for_status()
-            nodes = resp.json() or []
-    except Exception as e:
-        logger.error("Failed to fetch nodes for test me: %s", e)
-        await _send_text_now(sender, "Couldn't find anything to test you on right now.")
+    """Show topic menu and store awaiting_topic_choice state in Redis."""
+    topics = get_quiz_topics(4)
+    if not topics:
+        await _send_text_now(sender, "No topics to quiz you on yet — keep learning!")
         return
 
-    if not nodes:
-        await _send_text_now(sender, "No topics from 3-7 days ago yet — keep learning!")
-        return
+    lines = ["Pick a topic to be quizzed on:\n"]
+    for i, t in enumerate(topics, 1):
+        lines.append(f"{i}. {t['topic'].title()} ({t['domain']}, bloom {t['bloom_score']})")
+    lines.append("5. Surprise me")
+    lines.append("\nReply with 1–5")
 
-    node = random.choice(nodes)
-    question = await get_recall_question(node, sender)
+    await _send_text_now(sender, "\n".join(lines))
+    _set_quiz_state(sender, {"state": "awaiting_topic_choice", "topics": topics})
 
-    twilio_sid = os.environ["TWILIO_ACCOUNT_SID"]
-    twilio_token = os.environ["TWILIO_AUTH_TOKEN"]
-    from_number = os.environ["TWILIO_WHATSAPP_NUMBER"]
-    messages_url = f"https://api.twilio.com/2010-04-01/Accounts/{twilio_sid}/Messages.json"
 
-    try:
-        media_url = await generate_and_upload_audio(question, sender)
-        async with httpx.AsyncClient() as client:
-            await client.post(
-                messages_url,
-                data={"From": from_number, "To": sender, "MediaUrl": media_url},
-                auth=(twilio_sid, twilio_token),
-                timeout=15,
+async def _handle_quiz_state(sender: str, user_text: str, quiz_state: dict) -> bool:
+    """
+    Handle a message that maps to an in-progress quiz.
+    Returns True if the message was consumed by the quiz flow, False otherwise.
+    """
+    state = quiz_state.get("state")
+    reply = user_text.strip().lower()
+
+    if state == "awaiting_topic_choice":
+        if reply not in {"1", "2", "3", "4", "5"}:
+            return False  # let normal flow handle it
+
+        topics = quiz_state.get("topics", [])
+        if reply == "5" or not topics:
+            # Surprise: pick any low-bloom topic at random
+            all_topics = get_quiz_topics(10)
+            chosen = random.choice(all_topics) if all_topics else None
+        else:
+            idx = int(reply) - 1
+            chosen = topics[idx] if idx < len(topics) else random.choice(topics)
+
+        if not chosen:
+            await _send_text_now(sender, "Couldn't find a topic. Try again later.")
+            _clear_quiz_state(sender)
+            return True
+
+        await _send_text_now(sender, f"Generating a question on *{chosen['topic'].title()}*…")
+        try:
+            q = await generate_question(chosen["topic"], chosen["domain"], chosen.get("content", ""))
+        except Exception as e:
+            logger.error("generate_question failed: %s", e)
+            await _send_text_now(sender, "Couldn't generate a question right now. Try again later.")
+            _clear_quiz_state(sender)
+            return True
+
+        msg_lines = [q["question"], ""]
+        for opt in q["options"]:
+            msg_lines.append(opt)
+        msg_lines.append("\nReply A, B, C or D")
+        await _send_text_now(sender, "\n".join(msg_lines))
+        _set_quiz_state(sender, {"state": "awaiting_answer", "question": q})
+        return True
+
+    if state == "awaiting_answer":
+        if reply not in {"a", "b", "c", "d", "1", "2", "3", "4"}:
+            return False  # unrecognised reply — let normal flow handle it
+
+        q = quiz_state.get("question", {})
+        is_correct, explanation = grade_answer(reply, q)
+        if is_correct:
+            result_line = "Correct!"
+        else:
+            correct_letter = ["A", "B", "C", "D"][q.get("correct_index", 0)]
+            result_line = f"Not quite — the answer was {correct_letter}."
+
+        pending = quiz_state.get("pending", [])
+        if pending:
+            # More questions queued — grade this one then advance to the next
+            await _send_text_now(sender, f"{result_line}\n\n{explanation}")
+            next_q = pending[0]
+            opts = next_q["options"]
+            msg = (
+                f"{next_q['question']}\n\n"
+                f"{opts[0]}\n{opts[1]}\n{opts[2]}\n{opts[3]}\n\n"
+                "Reply A, B, C or D"
             )
-    except Exception as e:
-        logger.error("Voice send failed for test me: %s", e)
-        await _send_text_now(sender, clean_for_text(question))
+            await _send_text_now(sender, msg)
+            _set_quiz_state(sender, {"state": "awaiting_answer", "question": next_q, "pending": pending[1:]})
+        else:
+            await _send_text_now(sender, f"{result_line}\n\n{explanation}\n\nWant another? Reply *test me* to go again.")
+            _clear_quiz_state(sender)
+        return True
+
+    return False
 
 
 async def _handle_report(sender: str) -> None:
@@ -618,6 +698,13 @@ async def webhook(
     if cmd in SETTINGS_COMMANDS:
         await _handle_settings_command(sender, cmd)
         return PlainTextResponse("", status_code=200)
+
+    # Quiz state machine — check before normal brain flow
+    quiz_state = _get_quiz_state(sender)
+    if quiz_state:
+        consumed = await _handle_quiz_state(sender, user_text, quiz_state)
+        if consumed:
+            return PlainTextResponse("", status_code=200)
 
     # Save transcript (fire and forget — don't block reply generation)
     asyncio.create_task(_save_transcript(user_text, is_voice_note))
