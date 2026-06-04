@@ -7,7 +7,7 @@ import logging
 import os
 import random
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from dotenv import load_dotenv
 
@@ -39,7 +39,7 @@ IMMEDIATE_COMMANDS = {"reply", "r"}
 SETTINGS_COMMANDS = {
     "faster", "slower", "american", "british", "shorter", "longer",
     "simpler", "deeper", "recap on", "recap off", "settings", "graph",
-    "test me", "report", "pdf report",
+    "test me", "report", "pdf report", "pause", "resume", "topics", "streak",
 }
 
 # ---------------------------------------------------------------------------
@@ -564,6 +564,137 @@ async def _handle_report(sender: str) -> None:
             logger.error("Failed to send report to %s: %s", sender, resp.text)
 
 
+async def _handle_graph(sender: str) -> None:
+    """Screenshot the live D3 knowledge graph and send as a WhatsApp image."""
+    try:
+        from playwright.async_api import async_playwright
+        from voice import _r2_upload_sync
+        async with async_playwright() as p:
+            browser = await p.chromium.launch()
+            context = await browser.new_context(
+                viewport={"width": 1400, "height": 900},
+                device_scale_factor=2,
+            )
+            page = await context.new_page()
+            await page.goto("http://localhost:8000/knowledge", wait_until="networkidle")
+            # Let D3 simulation settle
+            await asyncio.sleep(3)
+            png_bytes = await page.screenshot(full_page=False)
+            await browser.close()
+    except Exception as e:
+        logger.error("Graph screenshot failed: %s", e)
+        await _send_text_now(sender, "Couldn't generate graph image — try again later.")
+        return
+
+    import uuid
+    filename = f"graph-{datetime.now(tz=timezone.utc).strftime('%Y-%m-%d')}-{uuid.uuid4()}.png"
+    try:
+        url = await asyncio.to_thread(_r2_upload_sync, png_bytes, filename, "image/png")
+    except Exception as e:
+        logger.error("Graph R2 upload failed: %s", e)
+        await _send_text_now(sender, "Couldn't upload graph — try again later.")
+        return
+
+    twilio_sid = os.environ["TWILIO_ACCOUNT_SID"]
+    twilio_token = os.environ["TWILIO_AUTH_TOKEN"]
+    from_number = os.environ["TWILIO_WHATSAPP_NUMBER"]
+    messages_url = f"https://api.twilio.com/2010-04-01/Accounts/{twilio_sid}/Messages.json"
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            messages_url,
+            data={"From": from_number, "To": sender, "MediaUrl": url, "Body": "Your knowledge graph 🧠"},
+            auth=(twilio_sid, twilio_token),
+            timeout=15,
+        )
+        if resp.status_code >= 400:
+            logger.error("Failed to send graph image: %s", resp.text)
+
+
+async def _handle_topics(sender: str) -> None:
+    """Fetch all knowledge nodes and send a domain-grouped list."""
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                sb_url("/rest/v1/knowledge_nodes"),
+                headers=sb_headers(),
+                params={"select": "domain,topic,bloom_score", "order": "domain.asc,bloom_score.desc"},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            nodes = resp.json() or []
+    except Exception as e:
+        logger.error("Failed to fetch nodes for topics: %s", e)
+        await _send_text_now(sender, "Couldn't fetch topics right now.")
+        return
+
+    if not nodes:
+        await _send_text_now(sender, "No topics in your knowledge graph yet — start chatting!")
+        return
+
+    # Group by domain
+    groups: dict[str, list[dict]] = {}
+    for n in nodes:
+        domain = n.get("domain", "general")
+        groups.setdefault(domain, []).append(n)
+
+    lines = [f"Your knowledge graph ({len(nodes)} topics):\n"]
+    for domain in sorted(groups):
+        lines.append(f"*{domain.title()}*")
+        for n in groups[domain]:
+            lines.append(f"  · {n['topic'].title()}  [bloom {n.get('bloom_score') or 1}]")
+    await _send_text_now(sender, "\n".join(lines))
+
+
+async def _handle_streak(sender: str) -> None:
+    """Count consecutive days with at least one transcript and report."""
+    since = (datetime.now(tz=timezone.utc) - timedelta(days=90)).isoformat()
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                sb_url("/rest/v1/transcripts"),
+                headers=sb_headers(),
+                params={"select": "created_at", "created_at": f"gte.{since}", "order": "created_at.desc"},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            rows = resp.json() or []
+    except Exception as e:
+        logger.error("Failed to fetch transcripts for streak: %s", e)
+        await _send_text_now(sender, "Couldn't calculate your streak right now.")
+        return
+
+    # Collect unique dates (UK local)
+    import pytz as _pytz
+    uk_tz = _pytz.timezone("Europe/London")
+    days_with_activity: set[str] = set()
+    for row in rows:
+        ts = row.get("created_at", "")
+        try:
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(uk_tz)
+            days_with_activity.add(dt.strftime("%Y-%m-%d"))
+        except Exception:
+            pass
+
+    # Count consecutive days ending today (or yesterday)
+    streak = 0
+    check = datetime.now(tz=uk_tz).date()
+    while check.strftime("%Y-%m-%d") in days_with_activity:
+        streak += 1
+        check = check - timedelta(days=1)
+
+    # If today has no activity yet, try streak ending yesterday
+    if streak == 0:
+        check = (datetime.now(tz=uk_tz) - timedelta(days=1)).date()
+        while check.strftime("%Y-%m-%d") in days_with_activity:
+            streak += 1
+            check = check - timedelta(days=1)
+
+    if streak == 0:
+        await _send_text_now(sender, "No streak yet — send a message today to start one!")
+    else:
+        await _send_text_now(sender, f"Your current streak: {streak} day{'s' if streak != 1 else ''} \U0001f525")
+
+
 async def _handle_pdf_report(sender: str) -> None:
     """Generate a detailed 7-day deep-dive PDF and send immediately."""
     await _send_text_now(sender, "Generating your deep-dive report, this may take a moment…")
@@ -662,7 +793,7 @@ async def _handle_settings_command(sender: str, cmd: str) -> None:
         ))
 
     elif cmd == "graph":
-        await _send_text_now(sender, "https://microlearn-production.up.railway.app/knowledge")
+        await _handle_graph(sender)
 
     elif cmd == "test me":
         await _handle_test_me(sender)
@@ -672,6 +803,24 @@ async def _handle_settings_command(sender: str, cmd: str) -> None:
 
     elif cmd == "pdf report":
         await _handle_pdf_report(sender)
+
+    elif cmd == "pause":
+        from upstash_redis import Redis as _Redis
+        _r = _Redis(url=os.environ["UPSTASH_REDIS_REST_URL"], token=os.environ["UPSTASH_REDIS_REST_TOKEN"])
+        _r.set(f"microlearn:paused:{sender}", "true")
+        await _send_text_now(sender, "Paused — I won't send replies until you say resume.")
+
+    elif cmd == "resume":
+        from upstash_redis import Redis as _Redis
+        _r = _Redis(url=os.environ["UPSTASH_REDIS_REST_URL"], token=os.environ["UPSTASH_REDIS_REST_TOKEN"])
+        _r.delete(f"microlearn:paused:{sender}")
+        await _send_text_now(sender, "Back on. I'll reply as normal.")
+
+    elif cmd == "topics":
+        await _handle_topics(sender)
+
+    elif cmd == "streak":
+        await _handle_streak(sender)
 
 
 @app.post("/webhook")

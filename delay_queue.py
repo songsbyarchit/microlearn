@@ -71,8 +71,14 @@ def schedule_reply(
 ) -> float:
     """
     Schedule a reply for future delivery. Returns the scheduled Unix timestamp.
+    Silently discards the reply if the user has paused notifications.
     """
     redis = _get_redis()
+
+    paused = redis.get(f"microlearn:paused:{to_number}")
+    if paused:
+        logger.info("Discarding reply to %s — user is paused.", to_number)
+        return 0.0
 
     delay_minutes = _sample_delay_minutes()
     raw_send_dt = datetime.now(tz=pytz.utc) + timedelta(minutes=delay_minutes)
