@@ -1,10 +1,13 @@
 """
 main.py — FastAPI app: Twilio webhook + D3.js knowledge graph dashboard.
 """
+import asyncio
 import json
 import logging
 import os
+import random
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 
 from dotenv import load_dotenv
 
@@ -14,10 +17,11 @@ import httpx
 from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
-from brain import get_reply
+from brain import get_recall_question, get_reply
 from delay_queue import pop_next_reply, schedule_reply
 from knowledge_graph import get_all_topics
-from supabase_client import ensure_table_exists
+from settings_manager import get_settings, save_settings
+from supabase_client import ensure_table_exists, sb_headers, sb_url
 from voice import clean_for_text, generate_and_upload_audio, transcribe_audio
 
 logging.basicConfig(
@@ -31,6 +35,11 @@ TWILIO_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
 MY_NUMBER = os.environ.get("MY_WHATSAPP_NUMBER", "")
 
 IMMEDIATE_COMMANDS = {"reply", "r"}
+SETTINGS_COMMANDS = {
+    "faster", "slower", "american", "british", "shorter", "longer",
+    "simpler", "deeper", "recap on", "recap off", "settings", "graph",
+    "test me", "report",
+}
 
 # ---------------------------------------------------------------------------
 # Knowledge graph HTML — fetches /knowledge/data at runtime
@@ -355,6 +364,207 @@ async def knowledge_viewer():
 # ---------------------------------------------------------------------------
 
 
+async def _send_text_now(to: str, text: str) -> None:
+    """Send a text message immediately (not via delay queue)."""
+    twilio_sid = os.environ["TWILIO_ACCOUNT_SID"]
+    twilio_token = os.environ["TWILIO_AUTH_TOKEN"]
+    from_number = os.environ["TWILIO_WHATSAPP_NUMBER"]
+    messages_url = f"https://api.twilio.com/2010-04-01/Accounts/{twilio_sid}/Messages.json"
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                messages_url,
+                data={"From": from_number, "To": to, "Body": text},
+                auth=(twilio_sid, twilio_token),
+                timeout=10,
+            )
+            if resp.status_code >= 400:
+                logger.error("_send_text_now failed %d: %s", resp.status_code, resp.text)
+    except Exception as e:
+        logger.warning("_send_text_now error: %s", e)
+
+
+async def _save_transcript(content: str, is_voice_note: bool) -> None:
+    """Persist a user message to the transcripts table."""
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                sb_url("/rest/v1/transcripts"),
+                headers=sb_headers(),
+                content=json.dumps({
+                    "content": content,
+                    "word_count": len(content.split()),
+                    "is_voice_note": is_voice_note,
+                    "created_at": datetime.now(tz=timezone.utc).isoformat(),
+                }),
+                timeout=10,
+            )
+            resp.raise_for_status()
+    except Exception as e:
+        logger.warning("Failed to save transcript: %s", e)
+
+
+async def _handle_test_me(sender: str) -> None:
+    """Pick a knowledge node from 3-7 days ago and send a recall question."""
+    from_dt = (datetime.now(tz=timezone.utc) - timedelta(days=7)).isoformat()
+    to_dt = (datetime.now(tz=timezone.utc) - timedelta(days=3)).isoformat()
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                sb_url("/rest/v1/knowledge_nodes"),
+                headers=sb_headers(),
+                params=[
+                    ("select", "domain,topic,bloom_score,content"),
+                    ("updated_at", f"gte.{from_dt}"),
+                    ("updated_at", f"lte.{to_dt}"),
+                    ("limit", "10"),
+                ],
+                timeout=10,
+            )
+            resp.raise_for_status()
+            nodes = resp.json() or []
+    except Exception as e:
+        logger.error("Failed to fetch nodes for test me: %s", e)
+        await _send_text_now(sender, "Couldn't find anything to test you on right now.")
+        return
+
+    if not nodes:
+        await _send_text_now(sender, "No topics from 3-7 days ago yet — keep learning!")
+        return
+
+    node = random.choice(nodes)
+    question = await get_recall_question(node, sender)
+
+    twilio_sid = os.environ["TWILIO_ACCOUNT_SID"]
+    twilio_token = os.environ["TWILIO_AUTH_TOKEN"]
+    from_number = os.environ["TWILIO_WHATSAPP_NUMBER"]
+    messages_url = f"https://api.twilio.com/2010-04-01/Accounts/{twilio_sid}/Messages.json"
+
+    try:
+        media_url = await generate_and_upload_audio(question, sender)
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                messages_url,
+                data={"From": from_number, "To": sender, "MediaUrl": media_url},
+                auth=(twilio_sid, twilio_token),
+                timeout=15,
+            )
+    except Exception as e:
+        logger.error("Voice send failed for test me: %s", e)
+        await _send_text_now(sender, clean_for_text(question))
+
+
+async def _handle_report(sender: str) -> None:
+    """Generate a 7-day PDF report and send immediately."""
+    try:
+        from report import generate_report_pdf
+        url, stats = await generate_report_pdf(7)
+    except Exception as e:
+        logger.error("Report generation failed: %s", e)
+        await _send_text_now(sender, "Report generation failed. Try again later.")
+        return
+
+    if not url:
+        await _send_text_now(sender, "No learning sessions recorded yet — send me a message first!")
+        return
+
+    twilio_sid = os.environ["TWILIO_ACCOUNT_SID"]
+    twilio_token = os.environ["TWILIO_AUTH_TOKEN"]
+    from_number = os.environ["TWILIO_WHATSAPP_NUMBER"]
+    messages_url = f"https://api.twilio.com/2010-04-01/Accounts/{twilio_sid}/Messages.json"
+
+    async with httpx.AsyncClient() as client:
+        await client.post(
+            messages_url,
+            data={"From": from_number, "To": sender, "MediaUrl": url, "Body": "Your MicroLearn report 📚"},
+            auth=(twilio_sid, twilio_token),
+            timeout=15,
+        )
+
+    await _send_text_now(
+        sender,
+        f"Last 7 days: {stats['total_messages']} messages, "
+        f"{stats['total_words']:,} words spoken, "
+        f"{stats['topic_count']} topics explored.",
+    )
+
+
+async def _handle_settings_command(sender: str, cmd: str) -> None:
+    """Mutate user settings or respond to info commands."""
+    settings = get_settings(sender)
+
+    if cmd == "faster":
+        settings["speaking_rate"] = round(min(3.0, settings["speaking_rate"] + 0.1), 1)
+        save_settings(sender, settings)
+        await _send_text_now(sender, f"Speaking rate set to {settings['speaking_rate']}x ✓")
+
+    elif cmd == "slower":
+        settings["speaking_rate"] = round(max(0.5, settings["speaking_rate"] - 0.1), 1)
+        save_settings(sender, settings)
+        await _send_text_now(sender, f"Speaking rate set to {settings['speaking_rate']}x ✓")
+
+    elif cmd == "american":
+        settings["voice_id"] = "pNInz6obpgDQGcFmaJgB"
+        save_settings(sender, settings)
+        await _send_text_now(sender, "Switched to American voice ✓")
+
+    elif cmd == "british":
+        settings["voice_id"] = "lUTamkMw7gOzZbFIwmq4"
+        save_settings(sender, settings)
+        await _send_text_now(sender, "Switched to British voice ✓")
+
+    elif cmd == "shorter":
+        settings["max_words"] = max(30, settings["max_words"] - 10)
+        save_settings(sender, settings)
+        await _send_text_now(sender, f"Max reply length set to {settings['max_words']} words ✓")
+
+    elif cmd == "longer":
+        settings["max_words"] = min(150, settings["max_words"] + 10)
+        save_settings(sender, settings)
+        await _send_text_now(sender, f"Max reply length set to {settings['max_words']} words ✓")
+
+    elif cmd == "simpler":
+        settings["bloom_target"] = max(1, settings["bloom_target"] - 1)
+        save_settings(sender, settings)
+        await _send_text_now(sender, f"Bloom target set to {settings['bloom_target']}/8 ✓")
+
+    elif cmd == "deeper":
+        settings["bloom_target"] = min(8, settings["bloom_target"] + 1)
+        save_settings(sender, settings)
+        await _send_text_now(sender, f"Bloom target set to {settings['bloom_target']}/8 ✓")
+
+    elif cmd == "recap on":
+        settings["recap_enabled"] = True
+        save_settings(sender, settings)
+        await _send_text_now(sender, "Recap messages enabled ✓")
+
+    elif cmd == "recap off":
+        settings["recap_enabled"] = False
+        save_settings(sender, settings)
+        await _send_text_now(sender, "Recap messages disabled ✓")
+
+    elif cmd == "settings":
+        voice = "British" if settings["voice_id"] == "lUTamkMw7gOzZbFIwmq4" else "American"
+        recap = "on" if settings["recap_enabled"] else "off"
+        await _send_text_now(sender, (
+            f"Your settings:\n"
+            f"• Speed: {settings['speaking_rate']}x\n"
+            f"• Voice: {voice}\n"
+            f"• Max words: {settings['max_words']}\n"
+            f"• Bloom target: {settings['bloom_target']}/8\n"
+            f"• Recap: {recap}"
+        ))
+
+    elif cmd == "graph":
+        await _send_text_now(sender, "https://microlearn-production.up.railway.app/knowledge")
+
+    elif cmd == "test me":
+        await _handle_test_me(sender)
+
+    elif cmd == "report":
+        await _handle_report(sender)
+
+
 @app.post("/webhook")
 async def webhook(
     request: Request,
@@ -408,8 +618,17 @@ async def webhook(
         logger.info("Empty message, ignoring.")
         return PlainTextResponse("", status_code=200)
 
+    # Settings commands
+    cmd = user_text.strip().lower()
+    if cmd in SETTINGS_COMMANDS:
+        await _handle_settings_command(sender, cmd)
+        return PlainTextResponse("", status_code=200)
+
+    # Save transcript (fire and forget — don't block reply generation)
+    asyncio.create_task(_save_transcript(user_text, is_voice_note))
+
     try:
-        reply_text, _kg = await get_reply(user_text)
+        reply_text, _kg = await get_reply(user_text, sender)
     except Exception as e:
         logger.error("Brain call failed: %s", e)
         return PlainTextResponse("", status_code=200)

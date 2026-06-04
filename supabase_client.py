@@ -24,7 +24,16 @@ CREATE TABLE IF NOT EXISTS knowledge_nodes (
     UNIQUE (domain, topic)
 );
 
--- 2. Conversation history with pgvector for semantic search
+-- 2. Transcript log
+CREATE TABLE IF NOT EXISTS transcripts (
+    id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    content     text,
+    created_at  timestamptz DEFAULT now(),
+    word_count  integer,
+    is_voice_note boolean DEFAULT false
+);
+
+-- 3. Conversation history with pgvector for semantic search
 CREATE EXTENSION IF NOT EXISTS vector;
 
 CREATE TABLE IF NOT EXISTS conversation_history (
@@ -83,7 +92,7 @@ def ensure_table_exists() -> None:
     Logs the full setup SQL and raises if either table is missing.
     """
     errors = []
-    for table in ("knowledge_nodes", "conversation_history"):
+    for table in ("knowledge_nodes", "conversation_history", "transcripts"):
         url = sb_url(f"/rest/v1/{table}?select=id&limit=1")
         try:
             resp = httpx.get(url, headers=sb_headers(), timeout=10)

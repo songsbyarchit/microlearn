@@ -17,8 +17,8 @@ logger = logging.getLogger(__name__)
 
 openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-ELEVENLABS_VOICE_ID = "lUTamkMw7gOzZbFIwmq4"
-ELEVENLABS_API_URL = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}"
+ELEVENLABS_VOICE_ID = "lUTamkMw7gOzZbFIwmq4"  # default (British)
+ELEVENLABS_DEFAULT_RATE = 2.0
 
 
 # ---------------------------------------------------------------------------
@@ -79,13 +79,13 @@ def _r2_upload_sync(audio_bytes: bytes, filename: str) -> str:
     return f"{public_url}/{filename}"
 
 
-async def generate_and_upload_audio(text: str) -> str:
+async def generate_and_upload_audio(text: str, sender: str = "") -> str:
     """
     Generate TTS audio and upload to Cloudflare R2.
     Returns the public URL of the uploaded MP3.
     Raises on failure so callers can fall back to text.
     """
-    audio_bytes = await text_to_speech(text)
+    audio_bytes = await text_to_speech(text, sender)
     filename = f"{uuid.uuid4()}.mp3"
     public_url = await asyncio.to_thread(_r2_upload_sync, audio_bytes, filename)
     logger.info("Uploaded audio to R2: %s", public_url)
@@ -133,23 +133,29 @@ async def transcribe_audio(audio_url: str, twilio_sid: str, twilio_token: str) -
 # TTS
 # ---------------------------------------------------------------------------
 
-async def _elevenlabs_tts(text: str, api_key: str) -> bytes:
+async def _elevenlabs_tts(
+    text: str,
+    api_key: str,
+    voice_id: str = ELEVENLABS_VOICE_ID,
+    speaking_rate: float = ELEVENLABS_DEFAULT_RATE,
+) -> bytes:
     """Call ElevenLabs TTS and return raw MP3 bytes."""
     logger.info(f"ElevenLabs key starts with: {api_key[:8] if api_key else 'EMPTY'}")
-    logger.info(f"ElevenLabs voice ID: {ELEVENLABS_VOICE_ID}")
+    logger.info(f"ElevenLabs voice ID: {voice_id} | rate: {speaking_rate}")
     ssml_text = post_process_for_tts(text)
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
     payload = {
         "text": ssml_text,
         "model_id": "eleven_monolingual_v1",
         "voice_settings": {
             "stability": 0.4,
             "similarity_boost": 0.8,
-            "speaking_rate": 1.6,
+            "speaking_rate": speaking_rate,
         },
     }
     async with httpx.AsyncClient() as client:
         resp = await client.post(
-            ELEVENLABS_API_URL,
+            url,
             json=payload,
             headers={
                 "xi-api-key": api_key,
@@ -172,17 +178,23 @@ async def _openai_tts(text: str) -> bytes:
     return response.content
 
 
-async def text_to_speech(text: str) -> bytes:
+async def text_to_speech(text: str, sender: str = "") -> bytes:
     """
-    Generate speech from text. Tries ElevenLabs first, falls back to OpenAI TTS.
+    Generate speech from text. Reads voice_id and speaking_rate from user settings.
+    Tries ElevenLabs first, falls back to OpenAI TTS.
     Returns raw MP3 bytes.
     """
-    logger.info("Generating TTS (%d chars)", len(text))
+    from settings_manager import get_settings
+    settings = get_settings(sender) if sender else {}
+    voice_id = settings.get("voice_id", ELEVENLABS_VOICE_ID)
+    speaking_rate = settings.get("speaking_rate", ELEVENLABS_DEFAULT_RATE)
+
+    logger.info("Generating TTS (%d chars, rate=%.1f)", len(text), speaking_rate)
 
     api_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
     if api_key:
         try:
-            audio = await _elevenlabs_tts(text, api_key)
+            audio = await _elevenlabs_tts(text, api_key, voice_id, speaking_rate)
             logger.info("ElevenLabs TTS ok (%d bytes)", len(audio))
             return audio
         except Exception as e:

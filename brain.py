@@ -13,6 +13,7 @@ import anthropic
 from openai import AsyncOpenAI
 
 from knowledge_graph import get_selective_context, parse_kg_json_from_response, update_knowledge_graph
+from settings_manager import DEFAULT_SETTINGS, get_settings
 from supabase_client import sb_headers, sb_url
 
 logger = logging.getLogger(__name__)
@@ -46,8 +47,8 @@ HOW YOU TEST:
   to a simpler analogy first.
 
 WORD COUNT -- STRICT:
-- Maximum 75 words per reply, always
-- Mirror the length of their message loosely but never exceed 75
+- Maximum {max_words} words per reply, always
+- Mirror the length of their message loosely but never exceed {max_words}
 - One idea per reply. If you have two ideas, pick the better one.
 - Less is more. The gap between messages is where they think.
 
@@ -68,14 +69,7 @@ LANGUAGE:
   "colour", "realise", "maths" etc -- never American spellings
 - No em dashes ever. Use a comma, full stop, or rewrite the sentence instead.
 
-RECAP RULE:
-- If this is not the first message, and the last exchange was more than
-  20 minutes ago, open with one sentence anchoring where we left off.
-  Max 15 words. Natural, not robotic.
-  Example: "So we were just getting into why miners stay honest..."
-- Never recap if the conversation is flowing quickly.
-
-VARIETY — rotate styles, never repeat the same one twice in a row:
+{recap_section}VARIETY — rotate styles, never repeat the same one twice in a row:
 - Pure question (no statement at all)
 - One bold claim followed by a question
 - An analogy first, then ask if it lands
@@ -118,10 +112,25 @@ The conversational reply comes FIRST, then the json_kg block.
 """
 
 
-def _build_system_prompt(knowledge_context: str, bloom_info: str) -> str:
+def _build_system_prompt(
+    knowledge_context: str,
+    bloom_info: str,
+    max_words: int = 75,
+    recap_enabled: bool = True,
+) -> str:
+    recap_section = (
+        "RECAP RULE:\n"
+        "- If this is not the first message, and the last exchange was more than\n"
+        "  20 minutes ago, open with one sentence anchoring where we left off.\n"
+        "  Max 15 words. Natural, not robotic.\n"
+        '  Example: "So we were just getting into why miners stay honest..."\n'
+        "- Never recap if the conversation is flowing quickly.\n\n"
+    ) if recap_enabled else ""
     return SYSTEM_PROMPT_TEMPLATE.format(
         knowledge_context=knowledge_context,
         bloom_info=bloom_info,
+        max_words=max_words,
+        recap_section=recap_section,
     )
 
 
@@ -222,14 +231,40 @@ async def get_relevant_context(user_message: str) -> list[dict[str, str]]:
 # Main entry point
 # ---------------------------------------------------------------------------
 
-async def get_reply(user_message: str) -> tuple[str, dict[str, Any] | None]:
+async def get_recall_question(node: dict, sender: str = "") -> str:
+    """Generate a spoken recall question for a knowledge node."""
+    prompt = (
+        f"Generate one recall question testing understanding of '{node['topic']}' "
+        f"(domain: {node['domain']}, bloom level: {node.get('bloom_score', 1)}). "
+        f"Test genuine application, not just definition recall. "
+        f"Write conversationally, as if asking a friend. "
+        f"Add [pause] markers where natural for spoken audio. "
+        f"Write just the question — nothing else."
+    )
+    response = await claude.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=150,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return response.content[0].text.strip()
+
+
+async def get_reply(user_message: str, sender: str = "") -> tuple[str, dict[str, Any] | None]:
     """
     Build context via semantic RAG, call Claude, store the exchange.
     Returns (reply_text, kg_update_dict | None).
     """
+    settings = get_settings(sender) if sender else dict(DEFAULT_SETTINGS)
+    max_words = settings.get("max_words", 75)
+    bloom_target = settings.get("bloom_target", 3)
+    recap_enabled = settings.get("recap_enabled", True)
+
     knowledge_context = get_selective_context(user_message, max_tokens=500)
-    bloom_info = "Unknown -- treat as beginner, introduce gently."
-    system_prompt = _build_system_prompt(knowledge_context, bloom_info)
+    bloom_info = (
+        f"Target Bloom level: {bloom_target}/8 "
+        f"(1=remember, 8=create). Push gently toward this level."
+    )
+    system_prompt = _build_system_prompt(knowledge_context, bloom_info, max_words, recap_enabled)
 
     history = await get_relevant_context(user_message)
 
@@ -240,7 +275,7 @@ async def get_reply(user_message: str) -> tuple[str, dict[str, Any] | None]:
 
     response = await claude.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=600,
+        max_tokens=max_words * 6,  # generous headroom for json_kg block
         system=system_prompt,
         messages=messages,
     )
