@@ -576,7 +576,8 @@ async def _handle_graph(sender: str) -> None:
                 device_scale_factor=2,
             )
             page = await context.new_page()
-            await page.goto("http://localhost:8000/knowledge", wait_until="networkidle")
+            graph_url = f"{os.environ['PUBLIC_BASE_URL']}/knowledge"
+            await page.goto(graph_url, wait_until="networkidle")
             # Let D3 simulation settle
             await asyncio.sleep(3)
             png_bytes = await page.screenshot(full_page=False)
