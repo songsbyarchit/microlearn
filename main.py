@@ -458,14 +458,14 @@ async def _handle_report(sender: str) -> None:
     """Generate a 7-day PDF report and send immediately."""
     try:
         from report import generate_report_pdf
-        url, stats = await generate_report_pdf(7)
+        url, _stats = await generate_report_pdf(7)
     except Exception as e:
         logger.error("Report generation failed: %s", e)
-        await _send_text_now(sender, "Report generation failed. Try again later.")
+        await _send_text_now(sender, "No data yet — keep learning!")
         return
 
     if not url:
-        await _send_text_now(sender, "No learning sessions recorded yet — send me a message first!")
+        await _send_text_now(sender, "No data yet — keep learning!")
         return
 
     twilio_sid = os.environ["TWILIO_ACCOUNT_SID"]
@@ -474,19 +474,14 @@ async def _handle_report(sender: str) -> None:
     messages_url = f"https://api.twilio.com/2010-04-01/Accounts/{twilio_sid}/Messages.json"
 
     async with httpx.AsyncClient() as client:
-        await client.post(
+        resp = await client.post(
             messages_url,
-            data={"From": from_number, "To": sender, "MediaUrl": url, "Body": "Your MicroLearn report 📚"},
+            data={"From": from_number, "To": sender, "MediaUrl": url, "Body": "Your last 7 days 📚"},
             auth=(twilio_sid, twilio_token),
             timeout=15,
         )
-
-    await _send_text_now(
-        sender,
-        f"Last 7 days: {stats['total_messages']} messages, "
-        f"{stats['total_words']:,} words spoken, "
-        f"{stats['topic_count']} topics explored.",
-    )
+        if resp.status_code >= 400:
+            logger.error("Failed to send report to %s: %s", sender, resp.text)
 
 
 async def _handle_settings_command(sender: str, cmd: str) -> None:
