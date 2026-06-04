@@ -354,12 +354,6 @@ async def knowledge_viewer():
 # Webhook
 # ---------------------------------------------------------------------------
 
-async def _send_reaction(to: str, emoji: str) -> None:
-    """No-op: Twilio sandbox does not support native WhatsApp reactions.
-    Sending standalone emoji messages is worse than nothing, so we suppress them.
-    """
-    logger.debug("Reaction %s suppressed (not supported in Twilio sandbox)", emoji)
-
 
 @app.post("/webhook")
 async def webhook(
@@ -414,9 +408,6 @@ async def webhook(
         logger.info("Empty message, ignoring.")
         return PlainTextResponse("", status_code=200)
 
-    # 👀 — seen, thinking
-    await _send_reaction(sender, "👀")
-
     try:
         reply_text, _kg = await get_reply(user_text)
     except Exception as e:
@@ -424,9 +415,6 @@ async def webhook(
         return PlainTextResponse("", status_code=200)
 
     schedule_reply(to_number=sender, reply_text=reply_text, send_as_voice=True)
-
-    # ✅ — reply queued
-    await _send_reaction(sender, "✅")
 
     return PlainTextResponse("", status_code=200)
 
