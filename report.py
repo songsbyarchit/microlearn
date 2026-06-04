@@ -250,7 +250,7 @@ async def _screenshot(html: str) -> bytes:
         browser = await p.chromium.launch()
         context = await browser.new_context(
             viewport={"width": 1080, "height": 1920},
-            device_scale_factor=3,
+            device_scale_factor=1,
         )
         page = await context.new_page()
         await page.set_content(html, wait_until="networkidle")
@@ -648,23 +648,23 @@ async def generate_detailed_pdf(days: int = 7) -> str:
         from playwright.async_api import async_playwright
         async with async_playwright() as p:
             browser = await p.chromium.launch()
-            context = await browser.new_context(
-                viewport={"width": 1200, "height": 1920},
-                device_scale_factor=2,
-            )
-            page = await context.new_page()
+            page = await browser.new_page()
             await page.set_content(html, wait_until="networkidle")
-            png_bytes = await page.screenshot(full_page=True)
+            pdf_bytes = await page.pdf(
+                format="A4",
+                print_background=True,
+                margin={"top": "20mm", "bottom": "20mm", "left": "15mm", "right": "15mm"},
+            )
             await browser.close()
     except Exception as e:
-        logger.error("Playwright detailed screenshot failed: %s", e)
+        logger.error("Playwright PDF generation failed: %s", e)
         return ""
 
     date_str = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
-    filename = f"report-detailed-{date_str}-{uuid.uuid4()}.png"
+    filename = f"report-detailed-{date_str}-{uuid.uuid4()}.pdf"
 
     try:
-        url = await asyncio.to_thread(_r2_upload_sync, png_bytes, filename, "image/png")
+        url = await asyncio.to_thread(_r2_upload_sync, pdf_bytes, filename, "application/pdf")
     except Exception as e:
         logger.error("R2 upload failed for detailed PDF: %s", e)
         return ""

@@ -1,10 +1,12 @@
 """
 brain.py — Claude API calls, semantic RAG context retrieval, system prompt construction.
 """
+import asyncio
 import json
 import logging
 import os
 import re
+import uuid
 from datetime import datetime, timezone
 from typing import Any
 
@@ -249,10 +251,76 @@ async def get_recall_question(node: dict, sender: str = "") -> str:
     return response.content[0].text.strip()
 
 
-async def get_reply(user_message: str, sender: str = "") -> tuple[str, dict[str, Any] | None]:
+async def maybe_generate_diagram(reply_text: str) -> str:
+    """
+    Ask Claude if a diagram would help, generate one via OpenAI if so.
+    Returns a public R2 URL, or "" on any failure or when not needed.
+    Non-blocking: all errors are caught and logged.
+    """
+    try:
+        # Step 1: YES/NO check
+        check = await claude.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=5,
+            messages=[{"role": "user", "content": (
+                f"Explanation:\n{reply_text}\n\n"
+                "Would a diagram significantly aid understanding of this explanation? "
+                "Reply only YES or NO."
+            )}],
+        )
+        if not check.content[0].text.strip().upper().startswith("YES"):
+            return ""
+
+        # Step 2: describe the ideal diagram
+        desc_resp = await claude.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=250,
+            messages=[{"role": "user", "content": (
+                f"Explanation:\n{reply_text}\n\n"
+                "Describe the ideal educational diagram to accompany this explanation. "
+                "Specify the diagram type, all elements, labels, layout, and visual style. "
+                "Be precise — this description is used directly as an image generation prompt."
+            )}],
+        )
+        diagram_desc = desc_resp.content[0].text.strip()
+        logger.info("Diagram description: %s", diagram_desc[:120])
+
+        # Step 3: generate image via OpenAI
+        img_resp = await openai_client.images.generate(
+            model="gpt-4o",
+            prompt=diagram_desc,
+            size="1024x1024",
+            n=1,
+        )
+        img_data = img_resp.data[0]
+        img_url = getattr(img_data, "url", None)
+
+        # Step 4: download image bytes
+        if img_url:
+            async with httpx.AsyncClient() as client:
+                dl = await client.get(img_url, timeout=30)
+                dl.raise_for_status()
+                img_bytes = dl.content
+        else:
+            import base64
+            img_bytes = base64.b64decode(img_data.b64_json)
+
+        # Step 5: upload to R2
+        from voice import _r2_upload_sync
+        filename = f"diagram-{uuid.uuid4()}.png"
+        public_url = await asyncio.to_thread(_r2_upload_sync, img_bytes, filename, "image/png")
+        logger.info("Diagram uploaded: %s", public_url)
+        return public_url
+
+    except Exception as e:
+        logger.warning("Diagram generation failed (non-fatal): %s", e)
+        return ""
+
+
+async def get_reply(user_message: str, sender: str = "") -> tuple[str, dict[str, Any] | None, str]:
     """
     Build context via semantic RAG, call Claude, store the exchange.
-    Returns (reply_text, kg_update_dict | None).
+    Returns (reply_text, kg_update_dict | None, diagram_url).
     """
     settings = get_settings(sender) if sender else dict(DEFAULT_SETTINGS)
     max_words = settings.get("max_words", 75)
