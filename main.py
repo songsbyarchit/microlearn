@@ -385,6 +385,28 @@ async def _send_text_now(to: str, text: str) -> None:
         logger.warning("_send_text_now error: %s", e)
 
 
+async def _send_voice_now(to: str, text: str) -> None:
+    """Generate TTS and send immediately as a voice note."""
+    twilio_sid = os.environ["TWILIO_ACCOUNT_SID"]
+    twilio_token = os.environ["TWILIO_AUTH_TOKEN"]
+    from_number = os.environ["TWILIO_WHATSAPP_NUMBER"]
+    messages_url = f"https://api.twilio.com/2010-04-01/Accounts/{twilio_sid}/Messages.json"
+    try:
+        media_url = await generate_and_upload_audio(text, sender=to)
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                messages_url,
+                data={"From": from_number, "To": to, "MediaUrl": media_url},
+                auth=(twilio_sid, twilio_token),
+                timeout=30,
+            )
+            if resp.status_code >= 400:
+                logger.error("_send_voice_now failed %d: %s", resp.status_code, resp.text)
+    except Exception as e:
+        logger.warning("_send_voice_now error, falling back to text: %s", e)
+        await _send_text_now(to, text)
+
+
 async def _save_transcript(content: str, is_voice_note: bool) -> None:
     """Persist a user message to the transcripts table."""
     try:
@@ -1208,7 +1230,7 @@ async def webhook(
         return PlainTextResponse("", status_code=200)
 
     # Voice note "help" — personalised usage advice
-    if is_voice_note and any(w in user_text.lower() for w in ("help", "how do i", "what can i", "what should i")):
+    if is_voice_note and any(w in user_text.lower() for w in ("help", "how do i", "how can i", "what can i", "what should i", "get more", "respond instantly", "no delay", "remove delay")):
         await _handle_help_voice(sender)
         return PlainTextResponse("", status_code=200)
 
@@ -1235,7 +1257,20 @@ async def webhook(
         logger.error("Brain call failed: %s", e)
         return PlainTextResponse("", status_code=200)
 
-    schedule_reply(to_number=sender, reply_text=reply_text, send_as_voice=True)
+    # --- Delay queue disabled for testing (comment back in to restore delays) ---
+    # schedule_reply(to_number=sender, reply_text=reply_text, send_as_voice=True)
+
+    # Check if brain signalled end of mini session
+    end_session = "[END_SESSION]" in reply_text
+    clean_reply = reply_text.replace("[END_SESSION]", "").strip()
+
+    # Send main reply immediately as voice note
+    await _send_voice_now(sender, clean_reply)
+
+    # If end of session, send a short closing message so user knows to come back later
+    if end_session:
+        closing = "I'll leave that with you. [pause] Come back whenever you're ready. 👋"
+        await _send_voice_now(sender, closing)
 
     return PlainTextResponse("", status_code=200)
 
