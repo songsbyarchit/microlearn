@@ -982,10 +982,10 @@ async def _send_checkpoint(sender: str) -> None:
         band = next_threshold - prev_thresh
         progress = total_xp - prev_thresh
         filled = round((progress / band) * 10)
-        bar = "█" * filled + "░" * (10 - filled)
+        bar = "▸" * filled + "▹" * (10 - filled)
         progress_line = f"{bar}  {total_xp}/{next_threshold} XP → {next_name}"
     else:
-        progress_line = f"Maximum level reached. {total_xp} XP total."
+        progress_line = f"▸▸▸▸▸▸▸▸▸▸  {total_xp} XP — maximum level reached."
 
     # Top topics by bloom
     top_topics = sorted(all_nodes, key=lambda n: n.get("bloom_score") or 1, reverse=True)[:3]
@@ -1001,9 +1001,7 @@ async def _send_checkpoint(sender: str) -> None:
     ) or "  None yet this session"
 
     text = (
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{level_emoji}  *{level_name}*  —  Level checkpoint\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"{level_emoji}  *{level_name}*  —  checkpoint\n\n"
         f"*This session*\n"
         f"💬 {session_msgs} messages  ·  {session_words:,} words spoken\n"
         f"🧠 {new_topics} topic{'s' if new_topics != 1 else ''} added or deepened\n"
