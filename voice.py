@@ -44,9 +44,10 @@ def post_process_for_tts(text: str) -> str:
     text = strip_markdown(text)
     text = text.replace("[long pause]", '<break time="0.9s"/>')
     text = text.replace("[pause]", '<break time="0.5s"/>')
-    # Remove punctuation that ElevenLabs reads literally, preserve full stops
+    # Remove punctuation that ElevenLabs/TTS reads literally as words
+    # Keep: . , ? — Remove: * _ # : ; - – — ( ) [ ] { } " ' / \
     import re
-    text = re.sub(r"[,;:\-–—()\[\]{}'\"!?/\\]", "", text)
+    text = re.sub(r"[*_#;:\-–—()\[\]{}'\"!?/\\]", "", text)
     # Collapse any double spaces left behind
     text = re.sub(r"  +", " ", text)
     return text.strip()
