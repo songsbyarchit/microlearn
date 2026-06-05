@@ -263,8 +263,102 @@ async def check_and_send_morning_recall() -> None:
     logger.info("Morning recall sent: %d questions for %s.", len(questions), today)
 
 
+async def check_and_send_afternoon_story() -> None:
+    """
+    At 15:00 UK time, send a ~2-minute narrative voice note about something
+    the user has been learning — a story, not just a fact.
+    """
+    uk_tz = pytz.timezone("Europe/London")
+    now_uk = datetime.now(tz=uk_tz)
+
+    if now_uk.hour != 15:
+        return
+
+    redis = Redis(
+        url=os.environ["UPSTASH_REDIS_REST_URL"],
+        token=os.environ["UPSTASH_REDIS_REST_TOKEN"],
+    )
+    today = now_uk.strftime("%Y-%m-%d")
+    last_date = redis.get("microlearn:last_story_date")
+    if last_date and last_date.strip('"') == today:
+        logger.info("Afternoon story already sent for %s.", today)
+        return
+
+    my_number = os.environ.get("MY_WHATSAPP_NUMBER", "")
+    if not my_number:
+        logger.warning("MY_WHATSAPP_NUMBER not set, cannot send afternoon story.")
+        return
+
+    # Pick a topic with some depth — bloom >= 3 preferred
+    try:
+        resp = httpx.get(
+            sb_url("/rest/v1/knowledge_nodes"),
+            headers=sb_headers(),
+            params=[
+                ("select", "domain,topic,bloom_score,content"),
+                ("bloom_score", "gte.3"),
+                ("order", "updated_at.desc"),
+                ("limit", "10"),
+            ],
+            timeout=10,
+        )
+        nodes = resp.json() or []
+    except Exception as e:
+        logger.warning("Afternoon story node fetch failed: %s", e)
+        return
+
+    if not nodes:
+        logger.info("No nodes with bloom >= 3 for afternoon story, skipping.")
+        return
+
+    import random as _random
+    node = _random.choice(nodes[:5])
+    topic = node["topic"]
+    domain = node.get("domain", "general")
+    content_snippet = (node.get("content") or "")[:800]
+
+    import anthropic as _anthropic
+    _claude = _anthropic.AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+
+    prompt = f"""You are MicroLearn, a brilliant curious friend. The user has been learning about {topic} (domain: {domain}).
+
+Here is what you know about their understanding so far:
+{content_snippet}
+
+Write a compelling 90-180 second spoken narrative voice note for them — not a lesson, but a *story*.
+Pick one surprising angle, historical moment, counterintuitive consequence, or real-world application related to {topic}.
+Tell it like you're sharing something that genuinely excites you.
+
+Structure: hook them in the first sentence, build through a narrative, land on one idea that reframes something they thought they knew.
+End with one open question that leaves a gap — something they'll want to think about or ask you about later.
+
+Write in spoken British English. After each sentence write [pause]. Before the final question write [long pause].
+No bullet points, no headers. Pure narrative. Around 220-260 words."""
+
+    try:
+        resp = await _claude.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=500,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        script = resp.content[0].text.strip()
+        logger.info("Afternoon story generated for topic '%s' (%d chars)", topic, len(script))
+    except Exception as e:
+        logger.error("Afternoon story Claude call failed: %s", e)
+        return
+
+    twilio_sid = os.environ["TWILIO_ACCOUNT_SID"]
+    twilio_token = os.environ["TWILIO_AUTH_TOKEN"]
+    from_number = os.environ["TWILIO_WHATSAPP_NUMBER"]
+
+    await send_voice(my_number, script, twilio_sid, twilio_token, from_number)
+    redis.set("microlearn:last_story_date", json.dumps(today))
+    logger.info("Afternoon story sent for %s (topic: %s).", today, topic)
+
+
 async def run_worker() -> None:
     await check_and_send_morning_recall()
+    await check_and_send_afternoon_story()
     await check_and_send_daily_report()
 
     twilio_sid = os.environ["TWILIO_ACCOUNT_SID"]

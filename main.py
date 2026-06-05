@@ -39,7 +39,7 @@ IMMEDIATE_COMMANDS = {"reply", "r"}
 SETTINGS_COMMANDS = {
     "faster", "slower", "american", "british", "shorter", "longer",
     "simpler", "deeper", "recap on", "recap off", "settings", "graph",
-    "test me", "report", "pdf report", "pause", "resume", "topics", "streak", "study",
+    "test me", "teach me", "help", "report", "pdf report", "pause", "resume", "topics", "streak", "study",
 }
 
 # ---------------------------------------------------------------------------
@@ -438,6 +438,35 @@ def _clear_quiz_state(phone: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Teach-it-back state helpers
+# ---------------------------------------------------------------------------
+
+def _teach_key(phone: str) -> str:
+    return f"microlearn:teach:{phone}"
+
+def _get_teach_state(phone: str) -> dict | None:
+    from upstash_redis import Redis
+    r = Redis(url=os.environ["UPSTASH_REDIS_REST_URL"], token=os.environ["UPSTASH_REDIS_REST_TOKEN"])
+    raw = r.get(_teach_key(phone))
+    if not raw:
+        return None
+    try:
+        return json.loads(raw) if isinstance(raw, str) else raw
+    except Exception:
+        return None
+
+def _set_teach_state(phone: str, state: dict) -> None:
+    from upstash_redis import Redis
+    r = Redis(url=os.environ["UPSTASH_REDIS_REST_URL"], token=os.environ["UPSTASH_REDIS_REST_TOKEN"])
+    r.set(_teach_key(phone), json.dumps(state), ex=3600)
+
+def _clear_teach_state(phone: str) -> None:
+    from upstash_redis import Redis
+    r = Redis(url=os.environ["UPSTASH_REDIS_REST_URL"], token=os.environ["UPSTASH_REDIS_REST_TOKEN"])
+    r.delete(_teach_key(phone))
+
+
+# ---------------------------------------------------------------------------
 # Quiz flow
 # ---------------------------------------------------------------------------
 
@@ -629,6 +658,219 @@ async def _handle_study(sender: str, domain: str) -> None:
         lines.append(f"Or reply *test me* to get quizzed on the ones due for review.")
 
     await _send_text_now(sender, "\n".join(lines))
+
+
+async def _handle_help_text(sender: str) -> None:
+    """Send a plain-text command reference."""
+    msg = (
+        "*MicroLearn — all commands* 📖\n\n"
+        "*Learning*\n"
+        "Just chat — ask me anything to learn it\n"
+        "*study <domain>* — e.g. study history, study geography\n"
+        "*test me* — quiz on your weakest topics\n"
+        "*teach me* — explain a topic back to me; I'll grade you\n\n"
+        "*Pacing*\n"
+        "*simpler* / *deeper* — adjust difficulty\n"
+        "*shorter* / *longer* — adjust reply length\n"
+        "*faster* / *slower* — adjust voice speed\n"
+        "*recap on* / *recap off* — session recaps\n"
+        "*reply* or *r* — skip delay, get reply now\n\n"
+        "*Progress*\n"
+        "*topics* — list your knowledge graph topics\n"
+        "*streak* — your learning streak\n"
+        "*graph* — visual knowledge map\n"
+        "*report* — one-page PNG summary\n"
+        "*pdf report* — full deep-dive PDF\n\n"
+        "*Other*\n"
+        "*pause* / *resume* — stop/start replies\n"
+        "*settings* — show current settings\n"
+        "*help* — this message (text)\n"
+        "🎤 voice note saying 'help' — personalised advice on how to get more from the app"
+    )
+    await _send_text_now(sender, msg)
+
+
+async def _handle_help_voice(sender: str) -> None:
+    """Send a personalised voice note about the user's usage and what to do more of."""
+    import anthropic as _anthropic
+    from knowledge_graph import _get
+
+    # Gather usage signals
+    try:
+        now_utc = datetime.now(tz=timezone.utc)
+        week_ago = (now_utc - timedelta(days=7)).isoformat()
+        month_ago = (now_utc - timedelta(days=30)).isoformat()
+
+        recent_resp = httpx.get(
+            sb_url("/rest/v1/transcripts"),
+            headers=sb_headers(),
+            params={"select": "content,is_voice_note,created_at", "created_at": f"gte.{week_ago}", "order": "created_at.desc", "limit": "50"},
+            timeout=10,
+        )
+        recent = recent_resp.json() or []
+
+        nodes_resp = _get({"select": "domain,topic,bloom_score,updated_at", "order": "updated_at.desc"})
+    except Exception as e:
+        logger.error("help voice data fetch failed: %s", e)
+        await _send_text_now(sender, "Couldn't load your usage data right now — try again later.")
+        return
+
+    total_msgs = len(recent)
+    voice_msgs = sum(1 for r in recent if r.get("is_voice_note"))
+    text_msgs = total_msgs - voice_msgs
+    domains = {}
+    for n in nodes_resp:
+        d = n.get("domain", "general")
+        domains[d] = domains.get(d, 0) + 1
+    top_domains = sorted(domains.items(), key=lambda x: x[1], reverse=True)[:5]
+    bloom_avg = sum(n.get("bloom_score") or 1 for n in nodes_resp) / max(len(nodes_resp), 1)
+    weak_topics = [n for n in nodes_resp if (n.get("bloom_score") or 1) <= 2]
+
+    context = f"""User usage summary (last 7 days):
+- Total messages: {total_msgs} ({voice_msgs} voice, {text_msgs} text)
+- Topics in knowledge graph: {len(nodes_resp)} across {len(domains)} domains
+- Top domains: {', '.join(f"{d} ({c} topics)" for d, c in top_domains) or 'none yet'}
+- Average bloom score: {bloom_avg:.1f}/8
+- Weak topics (bloom ≤ 2): {len(weak_topics)} — {', '.join(n['topic'] for n in weak_topics[:5]) or 'none'}
+- Features probably not used recently: {'teach me' if total_msgs < 5 else ''} {'study <domain>' if not domains else ''}
+"""
+
+    _claude = _anthropic.AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+    prompt = f"""{context}
+
+You are MicroLearn, a personal learning companion on WhatsApp. The user has sent a voice note asking for help.
+Give them a warm, honest, specific 90-second personalised voice note that:
+1. Tells them what they're getting real value from already
+2. Points to one or two things they haven't used much that would genuinely help them
+3. Gives a concrete suggestion for what to do today based on their weak spots or domains
+
+Write as spoken British English. After each sentence write [pause]. Before any question write [long pause].
+No bullet points, no headers. Conversational. Around 200 words."""
+
+    try:
+        resp = await _claude.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=400,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        script = resp.content[0].text.strip()
+    except Exception as e:
+        logger.error("help voice Claude call failed: %s", e)
+        await _send_text_now(sender, "Couldn't generate your personalised help right now.")
+        return
+
+    try:
+        audio_url = await generate_and_upload_audio(script, sender=sender)
+        twilio_sid = os.environ["TWILIO_ACCOUNT_SID"]
+        twilio_token = os.environ["TWILIO_AUTH_TOKEN"]
+        from_number = os.environ["TWILIO_WHATSAPP_NUMBER"]
+        messages_url = f"https://api.twilio.com/2010-04-01/Accounts/{twilio_sid}/Messages.json"
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                messages_url,
+                data={"From": from_number, "To": sender, "MediaUrl": audio_url},
+                auth=(twilio_sid, twilio_token),
+                timeout=30,
+            )
+    except Exception as e:
+        logger.error("help voice send failed: %s", e)
+        await _send_text_now(sender, "Couldn't send voice note — try typing *help* for the text version.")
+
+
+async def _handle_teach_me(sender: str) -> None:
+    """Pick a topic the user knows and ask them to explain it from scratch."""
+    from knowledge_graph import _get
+    try:
+        nodes = _get({"select": "domain,topic,bloom_score,content", "order": "bloom_score.desc", "limit": "10"})
+    except Exception as e:
+        logger.error("teach me fetch failed: %s", e)
+        await _send_text_now(sender, "Couldn't load your topics right now.")
+        return
+
+    # Pick a topic with bloom 3-7 — known enough to explain, not so easy it's trivial
+    candidates = [n for n in nodes if 3 <= (n.get("bloom_score") or 1) <= 7]
+    if not candidates:
+        candidates = nodes
+    if not candidates:
+        await _send_text_now(sender, "No topics to teach back yet — have a few conversations first.")
+        return
+
+    chosen = random.choice(candidates[:5])
+    topic = chosen["topic"]
+    domain = chosen.get("domain", "general")
+
+    _set_teach_state(sender, {"topic": topic, "domain": domain, "bloom_score": chosen.get("bloom_score", 3)})
+
+    await _send_text_now(
+        sender,
+        f"Alright — explain *{topic.title()}* to me as if I've never heard of it. "
+        f"Voice note or text, whatever feels natural. Don't look anything up — just go from memory."
+    )
+
+
+async def _handle_teach_response(sender: str, user_text: str, teach_state: dict) -> bool:
+    """Grade the user's explanation and update SRS. Returns True if consumed."""
+    import anthropic as _anthropic
+    from knowledge_graph import update_srs
+
+    topic = teach_state.get("topic", "")
+    domain = teach_state.get("domain", "general")
+    bloom = teach_state.get("bloom_score", 3)
+
+    _clear_teach_state(sender)
+
+    _claude = _anthropic.AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+    prompt = f"""Topic: {topic} (domain: {domain}, current bloom score: {bloom}/8)
+
+The user's explanation:
+\"\"\"{user_text}\"\"\"
+
+Evaluate this explanation. Respond with JSON only:
+{{
+  "score": 0-10,
+  "correct": ["things they got right"],
+  "gaps": ["important things missing or wrong"],
+  "verdict": "one warm sentence summarising how well they did",
+  "follow_up": "one question to push their understanding one level deeper"
+}}"""
+
+    try:
+        resp = await _claude.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=400,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = resp.content[0].text.strip()
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        data = json.loads(raw.strip())
+    except Exception as e:
+        logger.error("teach grading failed: %s", e)
+        await _send_text_now(sender, "Couldn't grade that right now — but good effort. Try again with *teach me*.")
+        return True
+
+    score = data.get("score", 5)
+    correct = data.get("correct", [])
+    gaps = data.get("gaps", [])
+    verdict = data.get("verdict", "")
+    follow_up = data.get("follow_up", "")
+
+    # Update SRS: score >= 7 counts as correct
+    update_srs(domain, topic, correct=(score >= 7))
+
+    # Build reply
+    lines = [verdict]
+    if correct:
+        lines.append("✅ " + " · ".join(correct[:3]))
+    if gaps:
+        lines.append("⚠️ Gaps: " + " · ".join(gaps[:3]))
+    if follow_up:
+        lines.append(f"\n{follow_up}")
+
+    await _send_text_now(sender, "\n\n".join(lines))
+    return True
 
 
 async def _handle_graph(sender: str) -> None:
@@ -899,6 +1141,12 @@ async def _handle_settings_command(sender: str, cmd: str) -> None:
         domain_arg = cmd[len("study "):].strip()
         await _handle_study(sender, domain_arg)
 
+    elif cmd == "help":
+        await _handle_help_text(sender)
+
+    elif cmd == "teach me":
+        await _handle_teach_me(sender)
+
 
 @app.post("/webhook")
 async def webhook(
@@ -958,6 +1206,18 @@ async def webhook(
     if cmd in SETTINGS_COMMANDS or cmd.startswith("study "):
         await _handle_settings_command(sender, cmd)
         return PlainTextResponse("", status_code=200)
+
+    # Voice note "help" — personalised usage advice
+    if is_voice_note and any(w in user_text.lower() for w in ("help", "how do i", "what can i", "what should i")):
+        await _handle_help_voice(sender)
+        return PlainTextResponse("", status_code=200)
+
+    # Teach-it-back state machine — check before quiz and brain
+    teach_state = _get_teach_state(sender)
+    if teach_state:
+        consumed = await _handle_teach_response(sender, user_text, teach_state)
+        if consumed:
+            return PlainTextResponse("", status_code=200)
 
     # Quiz state machine — check before normal brain flow
     quiz_state = _get_quiz_state(sender)
