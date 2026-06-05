@@ -918,6 +918,118 @@ Evaluate this explanation. Respond with JSON only:
     return True
 
 
+async def _send_checkpoint(sender: str) -> None:
+    """
+    Gamified checkpoint after every explain-back recap:
+    - Text: session stats + XP/level card
+    - Voice: where we can go next (the three options)
+    """
+    from knowledge_graph import _get
+
+    now_utc = datetime.now(tz=timezone.utc)
+    session_start = (now_utc - timedelta(hours=2)).isoformat()
+
+    # Session transcripts (last 2 hours)
+    try:
+        resp = httpx.get(
+            sb_url("/rest/v1/transcripts"),
+            headers=sb_headers(),
+            params={"select": "word_count,is_voice_note", "created_at": f"gte.{session_start}"},
+            timeout=10,
+        )
+        session_txs = resp.json() or []
+    except Exception:
+        session_txs = []
+
+    # All knowledge nodes
+    try:
+        all_nodes = _get({"select": "topic,domain,bloom_score,updated_at"})
+    except Exception:
+        all_nodes = []
+
+    session_nodes = [n for n in all_nodes if (n.get("updated_at") or "") >= session_start]
+
+    session_words  = sum(t.get("word_count") or 0 for t in session_txs)
+    session_msgs   = len(session_txs)
+    new_topics     = len(session_nodes)
+    total_topics   = len(all_nodes)
+    session_xp     = sum(n.get("bloom_score") or 1 for n in session_nodes)
+    total_xp       = sum(n.get("bloom_score") or 1 for n in all_nodes)
+
+    # Level thresholds
+    LEVELS = [
+        (0,   "Novice",      "🌱"),
+        (15,  "Apprentice",  "📖"),
+        (40,  "Explorer",    "🧭"),
+        (80,  "Scholar",     "🎓"),
+        (150, "Expert",      "⚡"),
+        (250, "Master",      "🏆"),
+        (400, "Sage",        "🌟"),
+    ]
+    level_name, level_emoji = LEVELS[0][1], LEVELS[0][2]
+    next_threshold, next_name = LEVELS[1][0], LEVELS[1][1]
+    for i, (thresh, name, emoji) in enumerate(LEVELS):
+        if total_xp >= thresh:
+            level_name, level_emoji = name, emoji
+            if i + 1 < len(LEVELS):
+                next_threshold, next_name = LEVELS[i + 1][0], LEVELS[i + 1][1]
+            else:
+                next_threshold, next_name = None, None
+
+    # Progress bar toward next level
+    if next_threshold:
+        prev_thresh = [t for t, _, _ in LEVELS if t <= total_xp][-1]
+        band = next_threshold - prev_thresh
+        progress = total_xp - prev_thresh
+        filled = round((progress / band) * 10)
+        bar = "█" * filled + "░" * (10 - filled)
+        progress_line = f"{bar}  {total_xp}/{next_threshold} XP → {next_name}"
+    else:
+        progress_line = f"Maximum level reached. {total_xp} XP total."
+
+    # Top topics by bloom
+    top_topics = sorted(all_nodes, key=lambda n: n.get("bloom_score") or 1, reverse=True)[:3]
+    top_lines = "\n".join(
+        f"  {'🥇' if i==0 else '🥈' if i==1 else '🥉'} {n['topic'].title()} — bloom {n.get('bloom_score') or 1}/8"
+        for i, n in enumerate(top_topics)
+    )
+
+    # Session topic lines
+    session_topic_lines = "\n".join(
+        f"  • {n['topic'].title()} ({n.get('domain','')}, bloom {n.get('bloom_score') or 1})"
+        for n in session_nodes[:5]
+    ) or "  None yet this session"
+
+    text = (
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{level_emoji}  *{level_name}*  —  Level checkpoint\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"*This session*\n"
+        f"💬 {session_msgs} messages  ·  {session_words:,} words spoken\n"
+        f"🧠 {new_topics} topic{'s' if new_topics != 1 else ''} added or deepened\n"
+        f"✨ +{session_xp} XP earned\n"
+        f"{session_topic_lines}\n\n"
+        f"*Overall*\n"
+        f"📚 {total_topics} topics in your knowledge graph\n"
+        f"🏅 {total_xp} total XP\n"
+        f"{progress_line}\n\n"
+        f"*Your strongest topics*\n"
+        f"{top_lines}"
+    )
+    await _send_text_now(sender, text)
+
+    # Voice: options for where to go next
+    options_script = (
+        "Right, checkpoint done. [pause] "
+        "Here are the options for where we can go next. [pause] "
+        "One: pause here and step away for now, come back whenever you're ready. [pause] "
+        "Two: take it in a completely different direction, just tell me what you want to explore. [pause] "
+        "Three: keep going deeper on exactly what we've been covering. [long pause] "
+        "Just say the number, or tell me by voice note."
+    )
+    await _send_voice_now(sender, options_script)
+
+
 async def _handle_graph(sender: str) -> None:
     """Screenshot the live D3 knowledge graph and send as a WhatsApp image."""
     try:
@@ -1325,16 +1437,10 @@ async def webhook(
         closing = "I'll leave that with you. [pause] Come back whenever you're ready. 👋"
         await _send_voice_now(sender, closing)
 
-    # After an explain-back assessment, offer the three session options as text
+    # After an explain-back assessment, send gamified checkpoint + voice options
     if offer_choice:
         _set_choice_state(sender)
-        await _send_text_now(sender,
-            "What do you want to do next?\n\n"
-            "1️⃣  *Pause* — step away, I'll wait\n"
-            "2️⃣  *Different direction* — take the conversation somewhere else\n"
-            "3️⃣  *Keep going* — go deeper on what we've been covering\n\n"
-            "Reply 1, 2, or 3 — or just say it by voice note."
-        )
+        await _send_checkpoint(sender)
 
     return PlainTextResponse("", status_code=200)
 
