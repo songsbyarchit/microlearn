@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_SETTINGS: dict = {
     "speaking_rate": 2.0,
     "voice_id": "lUTamkMw7gOzZbFIwmq4",
-    "max_words": 75,
+    "max_words": 120,
     "bloom_target": 3,
     "recap_enabled": True,
 }
