@@ -167,6 +167,21 @@ async def _embed(text: str) -> list[float]:
     return response.data[0].embedding
 
 
+def clear_conversation_history() -> None:
+    """Delete all rows from conversation_history to start a fresh session."""
+    try:
+        resp = httpx.delete(
+            sb_url("/rest/v1/conversation_history"),
+            headers=sb_headers(),
+            params={"id": "neq.00000000-0000-0000-0000-000000000000"},  # match all rows
+            timeout=10,
+        )
+        resp.raise_for_status()
+        logger.info("Conversation history cleared.")
+    except Exception as e:
+        logger.error("Failed to clear conversation history: %s", e)
+
+
 async def store_message(role: str, content: str) -> None:
     """Embed and store a message in Supabase conversation_history."""
     try:

@@ -159,7 +159,7 @@ async def _elevenlabs_tts(
     logger.info("ElevenLabs speed param: %.3f (from internal rate %.2f)", el_speed, speaking_rate)
     payload = {
         "text": ssml_text,
-        "model_id": "eleven_monolingual_v1",
+        "model_id": "eleven_turbo_v2",  # supports top-level speed param; monolingual_v1 does not
         "speed": el_speed,
         "voice_settings": {
             "stability": 0.4,
@@ -181,10 +181,10 @@ async def _elevenlabs_tts(
 
 
 async def _openai_tts(text: str) -> bytes:
-    """OpenAI TTS fallback -- returns raw MP3 bytes."""
+    """OpenAI TTS fallback -- returns raw MP3 bytes. Using 'onyx' (closest to British male)."""
     response = await openai_client.audio.speech.create(
         model="tts-1",
-        voice="alloy",
+        voice="onyx",
         input=clean_for_text(text),
         response_format="mp3",
     )
