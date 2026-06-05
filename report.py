@@ -425,19 +425,20 @@ def _build_detailed_html(
                 time_label = datetime.fromisoformat(ts_str.replace("Z", "+00:00")).strftime("%H:%M")
             except Exception:
                 time_label = "—"
-            kind = "voice" if t.get("is_voice_note") else "text"
+            is_voice = t.get("is_voice_note")
+            kind = "voice" if is_voice else "text"
+            badge_class = "tx-badge" if is_voice else "tx-badge text"
             content = _esc(t.get("content", ""))
             rows.append(
                 f'<div class="tx-row">'
-                f'<div class="tx-meta">{time_label} <span class="tx-kind">{kind}</span></div>'
-                f'<div class="tx-content">{content}</div>'
+                f'<span class="tx-time">{time_label}</span>'
+                f'<span class="{badge_class}">{kind}</span>'
+                f'<span class="tx-content">{content}</span>'
                 f'</div>'
             )
         transcripts_html_parts.append(
-            f'<div class="day-block">'
-            f'<div class="day-heading">{_esc(day_label)}</div>'
-            + "".join(rows) +
-            f'</div>'
+            f'<div class="day-label">{_esc(day_label)}</div>'
+            + "".join(rows)
         )
     transcripts_html = "".join(transcripts_html_parts) or '<p class="empty">No transcripts in this period.</p>'
 
@@ -470,157 +471,298 @@ def _build_detailed_html(
         filler_html = '<p class="empty">No filler words detected — clean speech throughout!</p>'
 
     # ── Section 5: Topic depth analysis ────────────────────────────────────
+    def _parse_node(content: str) -> dict:
+        """Extract summary, vocab, edges from markdown node content."""
+        summary = ""
+        vocab: list[str] = []
+        m = re.search(r"## Summary\n(.*?)(?=\n##|\Z)", content, re.DOTALL)
+        if m:
+            summary = m.group(1).strip()
+        m2 = re.search(r"## Vocabulary\n(.*?)(?=\n##|\Z)", content, re.DOTALL)
+        if m2:
+            vocab = [v.lstrip("- ").strip() for v in m2.group(1).strip().splitlines() if v.strip().lstrip("- ")]
+            vocab = [v for v in vocab if v and v.lower() not in ("(none)", "none")]
+        return {"summary": summary, "vocab": vocab}
+
     depth_parts = []
     for n in nodes:
         content = (n.get("content") or "").strip()
-        summary = _esc(content[:400] + ("…" if len(content) > 400 else "")) if content else "No summary available."
+        parsed = _parse_node(content)
+        summary = _esc(parsed["summary"]) if parsed["summary"] else "No summary available yet."
+        vocab_chips = "".join(f'<span class="vocab-chip">{_esc(v)}</span>' for v in parsed["vocab"][:8])
+        vocab_html = f'<div class="depth-vocab">{vocab_chips}</div>' if vocab_chips else ""
         depth_parts.append(
             f'<div class="depth-block">'
-            f'<div class="depth-title">{_esc(n["topic"].title())}'
-            f'<span class="depth-meta">{_esc(n.get("domain", ""))} · bloom {n.get("bloom_score") or 1}</span>'
-            f'</div>'
-            f'<p class="depth-text">{summary}</p>'
+            f'<div class="depth-title">{_esc(n["topic"].title())}</div>'
+            f'<div class="depth-tags">{_esc(n.get("domain", ""))} &nbsp;·&nbsp; bloom {n.get("bloom_score") or 1}/8</div>'
+            f'<p class="depth-summary">{summary}</p>'
+            f'{vocab_html}'
             f'</div>'
         )
     depth_html = "".join(depth_parts) or '<p class="empty">No topic content available.</p>'
 
-    # ── Section 6: Recommendations (pre-rendered text → HTML) ──────────────
-    rec_lines = []
+    # ── Section 6: Recommendations ──────────────────────────────────────────
+    rec_items = []
+    num = 0
     for line in recommendations.splitlines():
         line = line.strip()
         if not line:
             continue
-        # Bold **text** → <strong>
+        # Strip leading "1. " / "- " numbering
+        line = re.sub(r"^\d+\.\s*", "", line)
+        line = re.sub(r"^-\s*", "", line)
         line = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", _esc(line))
-        rec_lines.append(f'<p class="rec-line">{line}</p>')
-    rec_html = "".join(rec_lines) or '<p class="empty">No recommendations available.</p>'
+        num += 1
+        rec_items.append(
+            f'<div class="rec-item">'
+            f'<div class="rec-num">{num}</div>'
+            f'<div class="rec-text">{line}</div>'
+            f'</div>'
+        )
+    rec_html = "".join(rec_items) or '<p class="empty">No recommendations available.</p>'
 
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=1200">
 <style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
 *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
 body {{
-  background: #1a1a2e;
-  color: #e2e8f0;
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
-  padding: 80px 100px 100px;
-  min-width: 1200px;
-  max-width: 1200px;
+  background: #ffffff;
+  color: #1a1a1a;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+  font-size: 11pt;
   line-height: 1.6;
+  padding: 0;
 }}
 
-/* Cover */
-.cover {{ margin-bottom: 72px; padding-bottom: 48px; border-bottom: 2px solid #252a4a; }}
-h1 {{ font-size: 56px; font-weight: 900; color: #4fc3f7; letter-spacing: -2px; line-height: 1; }}
-.cover-sub {{ font-size: 22px; color: #6b7a99; margin-top: 12px; margin-bottom: 40px; }}
-.cover-stats {{ display: flex; gap: 20px; }}
-.cstat {{ background: #1e2240; border-left: 4px solid #4fc3f7; padding: 22px 28px; border-radius: 10px; flex: 1; }}
-.cstat .n {{ font-size: 44px; font-weight: 800; color: #4fc3f7; line-height: 1; }}
-.cstat .l {{ font-size: 13px; color: #6b7a99; margin-top: 6px; }}
-
-/* Section heading */
-.section {{ margin-bottom: 64px; }}
-.section-label {{
-  font-size: 11px; font-weight: 700; letter-spacing: 0.18em;
-  text-transform: uppercase; color: #4fc3f7;
-  border-left: 4px solid #4fc3f7; padding-left: 14px;
-  margin-bottom: 24px;
+/* ── Page layout ── */
+.page {{
+  width: 100%;
+  padding: 40px 56px;
 }}
 
-/* Transcripts */
-.day-block {{ margin-bottom: 36px; }}
-.day-heading {{ font-size: 15px; font-weight: 700; color: #94a3b8; margin-bottom: 12px; letter-spacing: 0.04em; text-transform: uppercase; }}
-.tx-row {{ display: flex; gap: 16px; padding: 10px 0; border-bottom: 1px solid #1e2240; align-items: flex-start; }}
+/* ── Header ── */
+.header {{
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  padding-bottom: 20px;
+  border-bottom: 2px solid #1a1a1a;
+  margin-bottom: 32px;
+}}
+.logo {{ font-size: 26pt; font-weight: 800; color: #1a1a1a; letter-spacing: -1px; }}
+.logo span {{ color: #2563eb; }}
+.header-meta {{ text-align: right; font-size: 9pt; color: #6b7280; line-height: 1.8; }}
+.header-meta strong {{ color: #1a1a1a; font-weight: 600; }}
+
+/* ── Stats row ── */
+.stats {{
+  display: flex;
+  gap: 16px;
+  margin-bottom: 40px;
+}}
+.stat {{
+  flex: 1;
+  border: 1.5px solid #e5e7eb;
+  border-radius: 8px;
+  padding: 16px 20px;
+  background: #f9fafb;
+}}
+.stat .n {{ font-size: 28pt; font-weight: 800; color: #2563eb; line-height: 1; }}
+.stat .l {{ font-size: 8.5pt; color: #6b7280; margin-top: 4px; font-weight: 500; text-transform: uppercase; letter-spacing: 0.06em; }}
+
+/* ── Section ── */
+.section {{ margin-bottom: 36px; page-break-inside: avoid; }}
+.section-title {{
+  font-size: 7.5pt;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: #2563eb;
+  margin-bottom: 14px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid #e5e7eb;
+}}
+
+/* ── Transcripts ── */
+.day-label {{
+  font-size: 8.5pt;
+  font-weight: 700;
+  color: #6b7280;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  margin-bottom: 8px;
+  margin-top: 16px;
+}}
+.day-label:first-child {{ margin-top: 0; }}
+.tx-row {{
+  display: flex;
+  gap: 14px;
+  padding: 6px 0;
+  border-bottom: 1px solid #f3f4f6;
+  align-items: baseline;
+}}
 .tx-row:last-child {{ border-bottom: none; }}
-.tx-meta {{ font-size: 12px; color: #475569; width: 72px; flex-shrink: 0; padding-top: 2px; }}
-.tx-kind {{ display: inline-block; background: #252a4a; border-radius: 4px; padding: 1px 5px; font-size: 10px; color: #64748b; }}
-.tx-content {{ font-size: 14px; color: #cbd5e1; flex: 1; }}
-
-/* Bloom table */
-.bloom-table {{ width: 100%; border-collapse: collapse; font-size: 14px; }}
-.bloom-table th {{ text-align: left; padding: 10px 14px; font-size: 11px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: #475569; border-bottom: 2px solid #252a4a; }}
-.bloom-table td {{ padding: 12px 14px; border-bottom: 1px solid #1e2240; color: #cbd5e1; }}
-.bloom-table tr:last-child td {{ border-bottom: none; }}
-.bloom-table td.score {{ font-size: 20px; font-weight: 800; color: #4fc3f7; }}
-
-/* Filler table */
-.filler-table {{ border-collapse: collapse; font-size: 13px; }}
-.filler-table th {{ padding: 8px 16px; font-size: 11px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: #475569; border-bottom: 2px solid #252a4a; text-align: center; }}
-.filler-table th:first-child {{ text-align: left; }}
-.filler-table td {{ padding: 8px 16px; border-bottom: 1px solid #1e2240; color: #94a3b8; text-align: center; }}
-.filler-table td:first-child {{ text-align: left; color: #64748b; }}
-.filler-table td.hi {{ color: #f97316; font-weight: 700; }}
-
-/* Topic depth */
-.depth-block {{ margin-bottom: 28px; padding: 20px 24px; background: #1e2240; border-radius: 10px; border-left: 3px solid #4fc3f7; }}
-.depth-title {{ font-size: 17px; font-weight: 700; color: #f8fafc; margin-bottom: 8px; display: flex; align-items: center; gap: 12px; }}
-.depth-meta {{ font-size: 12px; color: #475569; font-weight: 400; }}
-.depth-text {{ font-size: 13px; color: #94a3b8; line-height: 1.65; }}
-
-/* Recommendations */
-.rec-line {{ font-size: 15px; color: #cbd5e1; margin-bottom: 14px; line-height: 1.6; }}
-.rec-line strong {{ color: #4fc3f7; }}
-
-.empty {{ font-size: 15px; color: #3d4565; font-style: italic; }}
-
-.footer {{
-  margin-top: 72px; font-size: 12px; color: #3d4565;
-  border-top: 1px solid #252a4a; padding-top: 20px;
+.tx-time {{ font-size: 8.5pt; color: #9ca3af; width: 38px; flex-shrink: 0; }}
+.tx-badge {{
+  font-size: 7pt; font-weight: 600; letter-spacing: 0.04em;
+  background: #eff6ff; color: #2563eb; border-radius: 3px;
+  padding: 1px 5px; flex-shrink: 0; align-self: center;
 }}
+.tx-badge.text {{ background: #f3f4f6; color: #6b7280; }}
+.tx-content {{ font-size: 10pt; color: #374151; flex: 1; line-height: 1.5; }}
+
+/* ── Bloom table ── */
+.bloom-table {{ width: 100%; border-collapse: collapse; font-size: 10pt; }}
+.bloom-table th {{
+  text-align: left; padding: 8px 12px;
+  font-size: 7.5pt; font-weight: 700; letter-spacing: 0.08em;
+  text-transform: uppercase; color: #6b7280;
+  border-bottom: 1.5px solid #e5e7eb;
+  background: #f9fafb;
+}}
+.bloom-table td {{ padding: 9px 12px; border-bottom: 1px solid #f3f4f6; color: #374151; }}
+.bloom-table tr:last-child td {{ border-bottom: none; }}
+.bloom-table td.score {{
+  font-size: 14pt; font-weight: 800; color: #2563eb; text-align: center;
+}}
+.bloom-table td.topic {{ font-weight: 600; color: #111827; }}
+.bloom-table td.domain {{
+  font-size: 8.5pt; color: #9ca3af; font-weight: 500;
+  text-transform: capitalize;
+}}
+
+/* ── Filler table ── */
+.filler-table {{ border-collapse: collapse; font-size: 9.5pt; }}
+.filler-table th {{
+  padding: 7px 14px; font-size: 7.5pt; font-weight: 700;
+  letter-spacing: 0.08em; text-transform: uppercase; color: #6b7280;
+  border-bottom: 1.5px solid #e5e7eb; text-align: center;
+  background: #f9fafb;
+}}
+.filler-table th:first-child {{ text-align: left; }}
+.filler-table td {{
+  padding: 7px 14px; border-bottom: 1px solid #f3f4f6;
+  color: #6b7280; text-align: center;
+}}
+.filler-table td:first-child {{ text-align: left; color: #374151; }}
+.filler-table td.hi {{ color: #dc2626; font-weight: 700; }}
+
+/* ── Topic depth ── */
+.depth-block {{
+  margin-bottom: 16px;
+  padding: 14px 18px;
+  border: 1px solid #e5e7eb;
+  border-left: 3px solid #2563eb;
+  border-radius: 6px;
+  background: #f9fafb;
+  page-break-inside: avoid;
+}}
+.depth-title {{
+  font-size: 11pt; font-weight: 700; color: #111827;
+  margin-bottom: 4px;
+}}
+.depth-tags {{
+  font-size: 8pt; color: #9ca3af; margin-bottom: 8px;
+  text-transform: capitalize;
+}}
+.depth-summary {{ font-size: 9.5pt; color: #4b5563; line-height: 1.6; margin-bottom: 6px; }}
+.depth-vocab {{
+  font-size: 8.5pt; color: #6b7280;
+  display: flex; flex-wrap: wrap; gap: 6px;
+}}
+.vocab-chip {{
+  background: #eff6ff; color: #2563eb; border-radius: 3px;
+  padding: 2px 7px; font-weight: 500;
+}}
+
+/* ── Recommendations ── */
+.rec-item {{ margin-bottom: 14px; display: flex; gap: 12px; align-items: flex-start; }}
+.rec-num {{
+  font-size: 9pt; font-weight: 800; color: #2563eb;
+  background: #eff6ff; border-radius: 50%;
+  width: 22px; height: 22px; display: flex;
+  align-items: center; justify-content: center;
+  flex-shrink: 0; margin-top: 1px;
+}}
+.rec-text {{ font-size: 10pt; color: #374151; line-height: 1.6; }}
+.rec-text strong {{ color: #111827; }}
+
+/* ── Footer ── */
+.footer {{
+  margin-top: 40px;
+  padding-top: 14px;
+  border-top: 1px solid #e5e7eb;
+  font-size: 8pt;
+  color: #9ca3af;
+  display: flex;
+  justify-content: space-between;
+}}
+
+.empty {{ font-size: 10pt; color: #9ca3af; font-style: italic; }}
 </style>
 </head>
 <body>
+<div class="page">
 
-<!-- ── Cover ── -->
-<div class="cover">
-  <h1>MicroLearn</h1>
-  <div class="cover-sub">7-Day Deep Dive &nbsp;·&nbsp; {_esc(date_range)}</div>
-  <div class="cover-stats">
-    <div class="cstat"><div class="n">{total_msgs}</div><div class="l">total messages</div></div>
-    <div class="cstat"><div class="n">{voice_count}</div><div class="l">voice notes</div></div>
-    <div class="cstat"><div class="n">{total_words:,}</div><div class="l">words spoken</div></div>
-    <div class="cstat"><div class="n">{topic_count}</div><div class="l">topics updated</div></div>
+<!-- ── Header ── -->
+<div class="header">
+  <div class="logo">Micro<span>Learn</span></div>
+  <div class="header-meta">
+    <strong>7-Day Deep Dive</strong><br>
+    {_esc(date_range)}
   </div>
 </div>
 
-<!-- ── Section 1: Transcripts ── -->
+<!-- ── Stats ── -->
+<div class="stats">
+  <div class="stat"><div class="n">{total_msgs}</div><div class="l">Messages</div></div>
+  <div class="stat"><div class="n">{voice_count}</div><div class="l">Voice Notes</div></div>
+  <div class="stat"><div class="n">{total_words:,}</div><div class="l">Words Spoken</div></div>
+  <div class="stat"><div class="n">{topic_count}</div><div class="l">Topics</div></div>
+</div>
+
+<!-- ── Transcripts ── -->
 <div class="section">
-  <div class="section-label">Full Transcripts</div>
+  <div class="section-title">Full Transcripts</div>
   {transcripts_html}
 </div>
 
-<!-- ── Section 2: Bloom Progression ── -->
+<!-- ── Bloom table ── -->
 <div class="section">
-  <div class="section-label">Bloom Score by Topic</div>
+  <div class="section-title">Knowledge Progress</div>
   <table class="bloom-table">
-    <thead><tr><th>Topic</th><th>Domain</th><th>Bloom</th><th>Last Updated</th></tr></thead>
+    <thead><tr><th>Topic</th><th>Domain</th><th style="text-align:center">Bloom</th><th>Last Updated</th></tr></thead>
     <tbody>{bloom_rows}</tbody>
   </table>
 </div>
 
-<!-- ── Section 3: Filler Trends ── -->
+<!-- ── Filler ── -->
 <div class="section">
-  <div class="section-label">Filler Word Trends</div>
+  <div class="section-title">Speech Patterns</div>
   {filler_html}
 </div>
 
-<!-- ── Section 4: Topic Depth ── -->
+<!-- ── Depth ── -->
 <div class="section">
-  <div class="section-label">Topic Depth Analysis</div>
+  <div class="section-title">Topic Depth</div>
   {depth_html}
 </div>
 
-<!-- ── Section 5: Recommendations ── -->
+<!-- ── Recommendations ── -->
 <div class="section">
-  <div class="section-label">Recommendations</div>
+  <div class="section-title">What to Focus on Next</div>
   {rec_html}
 </div>
 
-<div class="footer">Generated by MicroLearn &nbsp;·&nbsp; {_esc(timestamp)}</div>
+<div class="footer">
+  <span>Generated by MicroLearn</span>
+  <span>{_esc(timestamp)}</span>
+</div>
 
+</div>
 </body>
 </html>"""
 
