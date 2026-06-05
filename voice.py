@@ -153,13 +153,17 @@ async def _elevenlabs_tts(
     logger.info(f"ElevenLabs voice ID: {voice_id} | rate: {speaking_rate}")
     ssml_text = post_process_for_tts(text)
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+    # ElevenLabs speed: top-level field, range 0.7–1.2 for most models.
+    # Map our internal scale (0.5–4.0) → ElevenLabs range (0.7–1.2).
+    el_speed = round(0.7 + (speaking_rate - 0.5) * (1.2 - 0.7) / (4.0 - 0.5), 3)
+    logger.info("ElevenLabs speed param: %.3f (from internal rate %.2f)", el_speed, speaking_rate)
     payload = {
         "text": ssml_text,
         "model_id": "eleven_monolingual_v1",
+        "speed": el_speed,
         "voice_settings": {
             "stability": 0.4,
             "similarity_boost": 0.8,
-            "speaking_rate": speaking_rate,
         },
     }
     async with httpx.AsyncClient() as client:
