@@ -649,7 +649,7 @@ async def generate_detailed_pdf(days: int = 7) -> str:
         async with async_playwright() as p:
             browser = await p.chromium.launch()
             page = await browser.new_page()
-            await page.set_content(html, wait_until="networkidle")
+            await page.set_content(html, wait_until="networkidle", timeout=60000)
             pdf_bytes = await page.pdf(
                 format="A4",
                 print_background=True,

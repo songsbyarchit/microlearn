@@ -39,7 +39,7 @@ IMMEDIATE_COMMANDS = {"reply", "r"}
 SETTINGS_COMMANDS = {
     "faster", "slower", "american", "british", "shorter", "longer",
     "simpler", "deeper", "recap on", "recap off", "settings", "graph",
-    "test me", "report", "pdf report", "pause", "resume", "topics", "streak",
+    "test me", "report", "pdf report", "pause", "resume", "topics", "streak", "study",
 }
 
 # ---------------------------------------------------------------------------
@@ -487,6 +487,8 @@ async def _handle_quiz_state(sender: str, user_text: str, quiz_state: dict) -> b
         await _send_text_now(sender, f"Generating a question on *{chosen['topic'].title()}*…")
         try:
             q = await generate_question(chosen["topic"], chosen["domain"], chosen.get("content", ""))
+            q["topic"] = chosen["topic"]
+            q["domain"] = chosen["domain"]
         except Exception as e:
             logger.error("generate_question failed: %s", e)
             await _send_text_now(sender, "Couldn't generate a question right now. Try again later.")
@@ -508,10 +510,17 @@ async def _handle_quiz_state(sender: str, user_text: str, quiz_state: dict) -> b
         q = quiz_state.get("question", {})
         is_correct, explanation = grade_answer(reply, q)
         if is_correct:
-            result_line = "Correct!"
+            result_line = "Correct! ✅"
         else:
             correct_letter = ["A", "B", "C", "D"][q.get("correct_index", 0)]
             result_line = f"Not quite — the answer was {correct_letter}."
+
+        # Update SRS interval for this topic
+        try:
+            from knowledge_graph import update_srs
+            update_srs(q.get("domain", "general"), q.get("topic", ""), is_correct)
+        except Exception as _srs_err:
+            logger.warning("SRS update failed (non-fatal): %s", _srs_err)
 
         pending = quiz_state.get("pending", [])
         if pending:
@@ -562,6 +571,64 @@ async def _handle_report(sender: str) -> None:
         )
         if resp.status_code >= 400:
             logger.error("Failed to send report to %s: %s", sender, resp.text)
+
+
+async def _handle_study(sender: str, domain: str) -> None:
+    """
+    Show the user a structured summary of what they know in a domain,
+    what's weak, what's due for review, and invite them to dive in.
+    """
+    from knowledge_graph import _get
+    from datetime import datetime, timezone
+
+    try:
+        rows = _get({
+            "select": "topic,bloom_score,next_review_at,updated_at",
+            "domain": f"eq.{domain}",
+            "order": "bloom_score.asc",
+        })
+    except Exception as e:
+        logger.error("study fetch failed: %s", e)
+        await _send_text_now(sender, f"Couldn't load topics for *{domain}* — try again.")
+        return
+
+    if not rows:
+        await _send_text_now(
+            sender,
+            f"No topics in *{domain}* yet. Just start chatting about it and I'll build your graph as we go."
+        )
+        return
+
+    now = datetime.now(tz=timezone.utc)
+    bloom_labels = {1: "just introduced", 2: "familiar", 3: "familiar", 4: "comfortable",
+                    5: "comfortable", 6: "strong", 7: "strong", 8: "mastered"}
+
+    due = [r for r in rows if r.get("next_review_at") and r["next_review_at"] <= now.isoformat()]
+    strong = [r for r in rows if (r.get("bloom_score") or 1) >= 6]
+    weak = [r for r in rows if (r.get("bloom_score") or 1) <= 3]
+
+    lines = [f"*{domain.title()}* — {len(rows)} topic{'s' if len(rows) != 1 else ''} in your graph\n"]
+
+    if due:
+        lines.append(f"🔁 *Due for review ({len(due)}):*")
+        for r in due[:5]:
+            lines.append(f"  • {r['topic'].title()} ({bloom_labels.get(r.get('bloom_score') or 1, '')})")
+
+    if weak:
+        lines.append(f"\n⚠️ *Needs work ({len(weak)}):*")
+        for r in weak[:5]:
+            lines.append(f"  • {r['topic'].title()}")
+
+    if strong:
+        lines.append(f"\n✅ *Strong ({len(strong)}):*")
+        for r in strong[:5]:
+            lines.append(f"  • {r['topic'].title()}")
+
+    lines.append(f"\nJust talk to me about any of these, or ask me something new in {domain.title()}.")
+    if due:
+        lines.append(f"Or reply *test me* to get quizzed on the ones due for review.")
+
+    await _send_text_now(sender, "\n".join(lines))
 
 
 async def _handle_graph(sender: str) -> None:
@@ -721,10 +788,12 @@ async def _handle_pdf_report(sender: str) -> None:
             messages_url,
             data={"From": from_number, "To": sender, "MediaUrl": url, "Body": "Your 7-day deep dive 📖"},
             auth=(twilio_sid, twilio_token),
-            timeout=15,
+            timeout=30,
         )
         if resp.status_code >= 400:
             logger.error("Failed to send detailed PDF to %s: %s", sender, resp.text)
+        else:
+            logger.info("Detailed PDF sent to %s: %s", sender, url)
 
 
 async def _handle_settings_command(sender: str, cmd: str) -> None:
@@ -823,6 +892,13 @@ async def _handle_settings_command(sender: str, cmd: str) -> None:
     elif cmd == "streak":
         await _handle_streak(sender)
 
+    elif cmd == "study":
+        await _send_text_now(sender, "Which domain? e.g. *study history* or *study geography*")
+
+    elif cmd.startswith("study "):
+        domain_arg = cmd[len("study "):].strip()
+        await _handle_study(sender, domain_arg)
+
 
 @app.post("/webhook")
 async def webhook(
@@ -879,7 +955,7 @@ async def webhook(
 
     # Settings commands
     cmd = user_text.strip().lower()
-    if cmd in SETTINGS_COMMANDS:
+    if cmd in SETTINGS_COMMANDS or cmd.startswith("study "):
         await _handle_settings_command(sender, cmd)
         return PlainTextResponse("", status_code=200)
 

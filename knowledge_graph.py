@@ -112,6 +112,10 @@ last_updated: {now_str}
 {history_md}
 """
 
+        # Set next_review_at to 1 day from now on first encounter
+        from datetime import timedelta
+        next_review = (datetime.now(tz=timezone.utc) + timedelta(days=1)).isoformat()
+
         row = {
             "domain": domain,
             "topic": topic,
@@ -119,6 +123,7 @@ last_updated: {now_str}
             "bloom_score": bloom_level,
             "edges": edges,
             "updated_at": now,
+            "next_review_at": next_review,
         }
 
         try:
@@ -133,6 +138,72 @@ last_updated: {now_str}
             logger.info("Upserted knowledge node: %s / %s (bloom %d)", domain, topic, bloom_level)
         except Exception as e:
             logger.error("Failed to upsert knowledge node %s/%s: %s", domain, topic, e)
+
+
+# ---------------------------------------------------------------------------
+# SRS interval update
+# ---------------------------------------------------------------------------
+
+# SM-2-style intervals in days: index = number of consecutive correct answers
+_SRS_INTERVALS = [1, 3, 7, 14, 30, 60]
+
+
+def update_srs(domain: str, topic: str, correct: bool) -> None:
+    """
+    After a quiz answer, update bloom_score and next_review_at for the node.
+    Correct → advance interval. Wrong → reset to 1 day and drop bloom_score by 1.
+    """
+    from datetime import timedelta
+
+    try:
+        rows = _get({
+            "select": "bloom_score,next_review_at",
+            "domain": f"eq.{domain}",
+            "topic": f"eq.{topic}",
+            "limit": "1",
+        })
+    except Exception as e:
+        logger.warning("SRS fetch failed for %s/%s: %s", domain, topic, e)
+        return
+
+    if not rows:
+        return
+
+    row = rows[0]
+    bloom = row.get("bloom_score") or 1
+
+    if correct:
+        # Advance: bloom goes up (max 8), interval advances along _SRS_INTERVALS
+        new_bloom = min(8, bloom + 1)
+        interval_idx = min(new_bloom - 1, len(_SRS_INTERVALS) - 1)
+        days = _SRS_INTERVALS[interval_idx]
+    else:
+        # Reset: bloom drops by 1 (min 1), back to 1-day interval
+        new_bloom = max(1, bloom - 1)
+        days = 1
+
+    next_review = (datetime.now(tz=timezone.utc) + timedelta(days=days)).isoformat()
+    now = datetime.now(tz=timezone.utc).isoformat()
+
+    try:
+        resp = httpx.patch(
+            sb_url("/rest/v1/knowledge_nodes"),
+            headers=sb_headers(),
+            params={"domain": f"eq.{domain}", "topic": f"eq.{topic}"},
+            content=json.dumps({
+                "bloom_score": new_bloom,
+                "next_review_at": next_review,
+                "updated_at": now,
+            }),
+            timeout=10,
+        )
+        resp.raise_for_status()
+        logger.info(
+            "SRS updated %s/%s: bloom %d→%d, next review in %d days",
+            domain, topic, bloom, new_bloom, days,
+        )
+    except Exception as e:
+        logger.error("SRS update failed for %s/%s: %s", domain, topic, e)
 
 
 # ---------------------------------------------------------------------------

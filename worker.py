@@ -166,33 +166,45 @@ async def check_and_send_morning_recall() -> None:
 
     now_utc = datetime.now(tz=timezone.utc)
 
-    def _fetch_node_for_window(days_ago: int) -> dict | None:
-        """Fetch lowest-bloom-score node updated roughly `days_ago` days ago."""
-        from datetime import timedelta
-        half = max(1, days_ago // 2)
-        since = (now_utc - timedelta(days=days_ago + half)).isoformat()
-        until = (now_utc - timedelta(days=max(0, days_ago - half))).isoformat()
+    def _fetch_due_nodes(limit: int = 5) -> list[dict]:
+        """Fetch nodes whose next_review_at is due, ordered by bloom_score asc."""
+        try:
+            resp = httpx.get(
+                sb_url("/rest/v1/knowledge_nodes"),
+                headers=sb_headers(),
+                params=[
+                    ("select", "domain,topic,bloom_score,content,next_review_at"),
+                    ("next_review_at", f"lte.{now_utc.isoformat()}"),
+                    ("order", "bloom_score.asc"),
+                    ("limit", str(limit)),
+                ],
+                timeout=10,
+            )
+            return resp.json() or []
+        except Exception as e:
+            logger.warning("Failed to fetch due nodes: %s", e)
+            return []
+
+    # Fall back to recency-based fetch if next_review_at column doesn't exist yet
+    # or no nodes are due
+    nodes = _fetch_due_nodes(3)
+    if not nodes:
+        # Fallback: pick 3 oldest-updated nodes
         try:
             resp = httpx.get(
                 sb_url("/rest/v1/knowledge_nodes"),
                 headers=sb_headers(),
                 params=[
                     ("select", "domain,topic,bloom_score,content"),
-                    ("updated_at", f"gte.{since}"),
-                    ("updated_at", f"lte.{until}"),
-                    ("order", "bloom_score.asc"),
-                    ("limit", "1"),
+                    ("order", "updated_at.asc"),
+                    ("limit", "3"),
                 ],
                 timeout=10,
             )
-            rows = resp.json() or []
-            return rows[0] if rows else None
+            nodes = resp.json() or []
         except Exception as e:
-            logger.warning("Failed to fetch node for %d-day window: %s", days_ago, e)
-            return None
-
-    nodes = [_fetch_node_for_window(d) for d in (1, 3, 7)]
-    nodes = [n for n in nodes if n]  # drop empty windows
+            logger.warning("Fallback node fetch failed: %s", e)
+            nodes = []
 
     if not nodes:
         logger.info("No nodes found for morning recall windows.")
@@ -204,6 +216,8 @@ async def check_and_send_morning_recall() -> None:
     for node in nodes:
         try:
             q = await generate_question(node["topic"], node["domain"], node.get("content", ""))
+            q["topic"] = node["topic"]
+            q["domain"] = node["domain"]
             questions.append(q)
         except Exception as e:
             logger.error("generate_question failed for %s: %s", node["topic"], e)
