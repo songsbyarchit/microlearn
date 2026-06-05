@@ -39,7 +39,7 @@ IMMEDIATE_COMMANDS = {"reply", "r"}
 SETTINGS_COMMANDS = {
     "faster", "slower", "american", "british", "shorter", "longer",
     "simpler", "deeper", "recap on", "recap off", "settings", "graph",
-    "test me", "teach me", "help", "reset", "report", "pdf report", "pause", "resume", "topics", "streak", "study",
+    "test me", "teach me", "help", "reset", "checkpoint", "report", "pdf report", "pause", "resume", "topics", "streak", "study",
 }
 
 # ---------------------------------------------------------------------------
@@ -1305,6 +1305,9 @@ async def _handle_settings_command(sender: str, cmd: str) -> None:
         from brain import clear_conversation_history
         clear_conversation_history()
         await _send_text_now(sender, "Session reset — fresh start. 🧹")
+
+    elif cmd == "checkpoint":
+        await _send_checkpoint(sender)
 
     elif cmd == "teach me":
         await _handle_teach_me(sender)
