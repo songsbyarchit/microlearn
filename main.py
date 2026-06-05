@@ -1236,6 +1236,16 @@ async def webhook(
         await _handle_settings_command(sender, cmd)
         return PlainTextResponse("", status_code=200)
 
+    # Voice note "test me" — trigger quiz
+    if is_voice_note and any(p in user_text.lower() for p in ("test me", "quiz me", "test my knowledge", "give me a test", "give me a quiz")):
+        await _handle_test_me(sender)
+        return PlainTextResponse("", status_code=200)
+
+    # Voice note "teach me" — trigger teach-it-back
+    if is_voice_note and any(p in user_text.lower() for p in ("teach me", "test my understanding", "let me explain")):
+        await _handle_teach_me(sender)
+        return PlainTextResponse("", status_code=200)
+
     # Voice note "help" — personalised usage advice
     if is_voice_note and any(w in user_text.lower() for w in ("help", "how do i", "how can i", "what can i", "what should i", "get more", "respond instantly", "no delay", "remove delay")):
         await _handle_help_voice(sender)
