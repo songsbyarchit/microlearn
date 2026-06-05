@@ -489,6 +489,29 @@ def _clear_teach_state(phone: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Session choice state (after explain-back recap)
+# ---------------------------------------------------------------------------
+
+def _choice_key(phone: str) -> str:
+    return f"microlearn:session_choice:{phone}"
+
+def _get_choice_state(phone: str) -> bool:
+    from upstash_redis import Redis
+    r = Redis(url=os.environ["UPSTASH_REDIS_REST_URL"], token=os.environ["UPSTASH_REDIS_REST_TOKEN"])
+    return bool(r.get(_choice_key(phone)))
+
+def _set_choice_state(phone: str) -> None:
+    from upstash_redis import Redis
+    r = Redis(url=os.environ["UPSTASH_REDIS_REST_URL"], token=os.environ["UPSTASH_REDIS_REST_TOKEN"])
+    r.set(_choice_key(phone), "1", ex=1800)  # 30 min TTL
+
+def _clear_choice_state(phone: str) -> None:
+    from upstash_redis import Redis
+    r = Redis(url=os.environ["UPSTASH_REDIS_REST_URL"], token=os.environ["UPSTASH_REDIS_REST_TOKEN"])
+    r.delete(_choice_key(phone))
+
+
+# ---------------------------------------------------------------------------
 # Quiz flow
 # ---------------------------------------------------------------------------
 
@@ -1251,6 +1274,18 @@ async def webhook(
         await _handle_help_voice(sender)
         return PlainTextResponse("", status_code=200)
 
+    # Session choice (after explain-back recap)
+    if _get_choice_state(sender):
+        _clear_choice_state(sender)
+        t = user_text.strip().lower()
+        if any(x in t for x in ("1", "pause", "step away", "break", "later", "stop")):
+            await _send_text_now(sender, "No rush. Come back whenever you're ready. 👋")
+            return PlainTextResponse("", status_code=200)
+        elif any(x in t for x in ("2", "different", "else", "other", "change", "switch", "new")):
+            await _send_text_now(sender, "Sure — what do you want to explore?")
+            return PlainTextResponse("", status_code=200)
+        # "3" / "keep going" / anything else → fall through to normal brain flow
+
     # Teach-it-back state machine — check before quiz and brain
     teach_state = _get_teach_state(sender)
     if teach_state:
@@ -1277,9 +1312,10 @@ async def webhook(
     # --- Delay queue disabled for testing (comment back in to restore delays) ---
     # schedule_reply(to_number=sender, reply_text=reply_text, send_as_voice=True)
 
-    # Check if brain signalled end of mini session
+    # Check for session markers
     end_session = "[END_SESSION]" in reply_text
-    clean_reply = reply_text.replace("[END_SESSION]", "").strip()
+    offer_choice = "[OFFER_CHOICE]" in reply_text
+    clean_reply = reply_text.replace("[END_SESSION]", "").replace("[OFFER_CHOICE]", "").strip()
 
     # Send main reply immediately as voice note
     await _send_voice_now(sender, clean_reply)
@@ -1288,6 +1324,17 @@ async def webhook(
     if end_session:
         closing = "I'll leave that with you. [pause] Come back whenever you're ready. 👋"
         await _send_voice_now(sender, closing)
+
+    # After an explain-back assessment, offer the three session options as text
+    if offer_choice:
+        _set_choice_state(sender)
+        await _send_text_now(sender,
+            "What do you want to do next?\n\n"
+            "1️⃣  *Pause* — step away, I'll wait\n"
+            "2️⃣  *Different direction* — take the conversation somewhere else\n"
+            "3️⃣  *Keep going* — go deeper on what we've been covering\n\n"
+            "Reply 1, 2, or 3 — or just say it by voice note."
+        )
 
     return PlainTextResponse("", status_code=200)
 
