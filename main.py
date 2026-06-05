@@ -1065,13 +1065,15 @@ async def _handle_settings_command(sender: str, cmd: str) -> None:
     settings = get_settings(sender)
 
     if cmd == "faster":
-        settings["speaking_rate"] = round(min(3.0, settings["speaking_rate"] + 0.1), 1)
+        settings["speaking_rate"] = round(min(4.0, settings["speaking_rate"] + 0.25), 2)
         save_settings(sender, settings)
+        logger.info("speaking_rate for %s set to %.2f", sender, settings["speaking_rate"])
         await _send_text_now(sender, f"Speaking rate set to {settings['speaking_rate']}x ✓")
 
     elif cmd == "slower":
-        settings["speaking_rate"] = round(max(0.5, settings["speaking_rate"] - 0.1), 1)
+        settings["speaking_rate"] = round(max(0.5, settings["speaking_rate"] - 0.25), 2)
         save_settings(sender, settings)
+        logger.info("speaking_rate for %s set to %.2f", sender, settings["speaking_rate"])
         await _send_text_now(sender, f"Speaking rate set to {settings['speaking_rate']}x ✓")
 
     elif cmd == "american":

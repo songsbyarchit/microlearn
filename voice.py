@@ -36,10 +36,19 @@ def strip_markdown(text: str) -> str:
 
 
 def post_process_for_tts(text: str) -> str:
-    """Strip markdown, then replace [pause] / [long pause] markers with SSML break tags for ElevenLabs."""
+    """
+    Strip markdown, replace pause markers with SSML breaks, then remove all
+    punctuation except full stops — commas, colons, semicolons, dashes, brackets
+    etc. are read aloud by ElevenLabs so we strip them before synthesis.
+    """
     text = strip_markdown(text)
     text = text.replace("[long pause]", '<break time="0.9s"/>')
     text = text.replace("[pause]", '<break time="0.5s"/>')
+    # Remove punctuation that ElevenLabs reads literally, preserve full stops
+    import re
+    text = re.sub(r"[,;:\-–—()\[\]{}'\"!?/\\]", "", text)
+    # Collapse any double spaces left behind
+    text = re.sub(r"  +", " ", text)
     return text.strip()
 
 
@@ -194,6 +203,7 @@ async def text_to_speech(text: str, sender: str = "") -> bytes:
     api_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
     if api_key:
         try:
+            logger.info("ElevenLabs TTS → voice_id=%s rate=%.2f chars=%d", voice_id, speaking_rate, len(text))
             audio = await _elevenlabs_tts(text, api_key, voice_id, speaking_rate)
             logger.info("ElevenLabs TTS ok (%d bytes)", len(audio))
             return audio
