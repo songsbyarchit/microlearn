@@ -239,16 +239,19 @@ def get_selective_context(user_message: str, max_tokens: int = 500) -> str:
     sections: list[str] = []
     chars_used = 0
 
-    primary_list = matched if matched else scored
-    if primary_list:
-        _, primary = primary_list[0]
-        full_text = primary.get("content") or f"Topic: {primary['topic']} (bloom {primary['bloom_score']})"
-        if chars_used + len(full_text) <= max_chars:
-            sections.append(f"### {primary['topic']} (full)\n{full_text}")
-            chars_used += len(full_text)
+    # Only inject context when there's an actual keyword match.
+    # If no match, return nothing — injecting unrelated old topics causes the
+    # bot to anchor on them instead of following the user's new topic.
+    if not matched:
+        return "No relevant knowledge nodes found."
 
-    remaining = (matched[1:] if matched else []) + [(s, r) for s, r in scored if s == 0]
-    for _, row in remaining:
+    _, primary = matched[0]
+    full_text = primary.get("content") or f"Topic: {primary['topic']} (bloom {primary['bloom_score']})"
+    if chars_used + len(full_text) <= max_chars:
+        sections.append(f"### {primary['topic']} (full)\n{full_text}")
+        chars_used += len(full_text)
+
+    for _, row in matched[1:]:
         summary = _extract_summary(row.get("content", ""))
         line = f"- {row['topic']} ({row['domain']}, bloom {row['bloom_score']}): {summary}"
         if chars_used + len(line) > max_chars:
