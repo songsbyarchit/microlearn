@@ -473,10 +473,101 @@ async def check_and_send_curiosity_hook() -> None:
     logger.info("Curiosity hook sent for %s.", today)
 
 
+async def check_and_send_topic_suggestion() -> None:
+    """Send new topic suggestions every Sunday at 10:00 UK time."""
+    uk_tz = pytz.timezone("Europe/London")
+    now_uk = datetime.now(tz=uk_tz)
+
+    if now_uk.weekday() != 6 or now_uk.hour != 10:
+        return
+
+    redis = Redis(
+        url=os.environ["UPSTASH_REDIS_REST_URL"],
+        token=os.environ["UPSTASH_REDIS_REST_TOKEN"],
+    )
+    today = now_uk.strftime("%Y-%m-%d")
+    last_date = redis.get("microlearn:last_suggestion_date")
+    if last_date and last_date.strip('"') == today:
+        logger.info("Topic suggestion already sent for %s.", today)
+        return
+
+    my_number = os.environ.get("MY_WHATSAPP_NUMBER", "")
+    if not my_number:
+        logger.warning("MY_WHATSAPP_NUMBER not set, cannot send topic suggestion.")
+        return
+
+    try:
+        resp = httpx.get(
+            sb_url("/rest/v1/knowledge_nodes"),
+            headers=sb_headers(),
+            params=[
+                ("select", "domain,topic,bloom_score"),
+                ("order", "updated_at.desc"),
+            ],
+            timeout=10,
+        )
+        nodes = resp.json() or []
+    except Exception as e:
+        logger.warning("Topic suggestion node fetch failed: %s", e)
+        return
+
+    if not nodes:
+        logger.info("No topics for suggestion, skipping.")
+        return
+
+    topics_list = ", ".join(
+        f"{n['topic']} ({n.get('domain', 'general')}, bloom {n.get('bloom_score') or 1})"
+        for n in nodes
+    )
+
+    import anthropic as _anthropic
+    _claude = _anthropic.AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+
+    prompt = (
+        f"Here are the topics this person has been learning with their domains and bloom scores: {topics_list}. "
+        "Identify two or three topics they haven't studied yet that would create genuinely interesting connections "
+        "with what they already know. For each suggestion, give the topic name and one sentence explaining why it "
+        "connects to something they've already covered. Format it as a casual WhatsApp message from a knowledgeable "
+        "friend, max 60 words total."
+    )
+
+    try:
+        resp = await _claude.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=150,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        suggestion_text = resp.content[0].text.strip()
+        logger.info("Topic suggestion generated (%d chars)", len(suggestion_text))
+    except Exception as e:
+        logger.error("Topic suggestion Claude call failed: %s", e)
+        return
+
+    twilio_sid = os.environ["TWILIO_ACCOUNT_SID"]
+    twilio_token = os.environ["TWILIO_AUTH_TOKEN"]
+    from_number = os.environ["TWILIO_WHATSAPP_NUMBER"]
+    messages_url = f"https://api.twilio.com/2010-04-01/Accounts/{twilio_sid}/Messages.json"
+
+    async with httpx.AsyncClient() as client:
+        r = await client.post(
+            messages_url,
+            data={"From": from_number, "To": my_number, "Body": suggestion_text},
+            auth=(twilio_sid, twilio_token),
+            timeout=15,
+        )
+        if r.status_code >= 400:
+            logger.error("Failed to send topic suggestion: %s", r.text)
+            return
+
+    redis.set("microlearn:last_suggestion_date", json.dumps(today))
+    logger.info("Topic suggestion sent for %s.", today)
+
+
 async def run_worker() -> None:
     await check_and_send_morning_recall()
     await check_and_send_afternoon_story()
     await check_and_send_curiosity_hook()
+    await check_and_send_topic_suggestion()
     await check_and_send_daily_report()
 
     twilio_sid = os.environ["TWILIO_ACCOUNT_SID"]
