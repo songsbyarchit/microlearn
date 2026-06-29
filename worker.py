@@ -356,9 +356,127 @@ No bullet points, no headers. Pure narrative. Around 220-260 words."""
     logger.info("Afternoon story sent for %s (topic: %s).", today, topic)
 
 
+async def check_and_send_curiosity_hook() -> None:
+    """
+    Once per day, send a surprising fact/connection as a plain WhatsApp text.
+    The send time is randomised to a minute within 11:00–17:00 UK, chosen fresh
+    each day and cached in Redis under microlearn:hook_time:{date}.
+    """
+    uk_tz = pytz.timezone("Europe/London")
+    now_uk = datetime.now(tz=uk_tz)
+    today = now_uk.strftime("%Y-%m-%d")
+
+    redis = Redis(
+        url=os.environ["UPSTASH_REDIS_REST_URL"],
+        token=os.environ["UPSTASH_REDIS_REST_TOKEN"],
+    )
+
+    # Only fire once per day
+    last_date = redis.get("microlearn:last_hook_date")
+    if last_date and last_date.strip('"') == today:
+        logger.info("Curiosity hook already sent for %s.", today)
+        return
+
+    # Determine (or generate) today's send time
+    hook_time_key = f"microlearn:hook_time:{today}"
+    raw_hook_time = redis.get(hook_time_key)
+    if raw_hook_time:
+        try:
+            hook_hour, hook_minute = map(int, raw_hook_time.strip('"').split(":"))
+        except Exception:
+            hook_hour, hook_minute = None, None
+    else:
+        hook_hour = None
+
+    if hook_hour is None:
+        import random as _random
+        hook_hour = _random.randint(11, 16)      # 11–16 inclusive → fires 11:xx–16:xx
+        hook_minute = _random.randint(0, 59)
+        redis.set(hook_time_key, f"{hook_hour}:{hook_minute}", ex=90000)  # 25-hour TTL
+        logger.info("Curiosity hook scheduled for %s at %02d:%02d UK", today, hook_hour, hook_minute)
+
+    if not (now_uk.hour == hook_hour and now_uk.minute == hook_minute):
+        return  # Not time yet
+
+    my_number = os.environ.get("MY_WHATSAPP_NUMBER", "")
+    if not my_number:
+        logger.warning("MY_WHATSAPP_NUMBER not set, cannot send curiosity hook.")
+        return
+
+    # Fetch topics from the knowledge graph
+    try:
+        resp = httpx.get(
+            sb_url("/rest/v1/knowledge_nodes"),
+            headers=sb_headers(),
+            params=[
+                ("select", "domain,topic,bloom_score"),
+                ("order", "updated_at.desc"),
+                ("limit", "20"),
+            ],
+            timeout=10,
+        )
+        nodes = resp.json() or []
+    except Exception as e:
+        logger.warning("Curiosity hook node fetch failed: %s", e)
+        return
+
+    if not nodes:
+        logger.info("No topics for curiosity hook, skipping.")
+        return
+
+    topics_list = ", ".join(
+        f"{n['topic']} ({n.get('domain', 'general')}, bloom {n.get('bloom_score') or 1})"
+        for n in nodes
+    )
+
+    import anthropic as _anthropic
+    _claude = _anthropic.AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+
+    prompt = (
+        f"Look at these knowledge graph topics the user has been learning: {topics_list}. "
+        "Generate one genuinely surprising, counterintuitive, or little-known fact that connects "
+        "to something they've studied, or introduces a natural adjacent topic. "
+        "Make it feel like something a brilliant friend just texted you — one or two sentences max, "
+        "no preamble, no 'did you know', just the fact stated compellingly. "
+        "End with a single open question that invites them to reply and go deeper."
+    )
+
+    try:
+        resp = await _claude.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=120,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        hook_text = resp.content[0].text.strip()
+        logger.info("Curiosity hook generated (%d chars)", len(hook_text))
+    except Exception as e:
+        logger.error("Curiosity hook Claude call failed: %s", e)
+        return
+
+    twilio_sid = os.environ["TWILIO_ACCOUNT_SID"]
+    twilio_token = os.environ["TWILIO_AUTH_TOKEN"]
+    from_number = os.environ["TWILIO_WHATSAPP_NUMBER"]
+    messages_url = f"https://api.twilio.com/2010-04-01/Accounts/{twilio_sid}/Messages.json"
+
+    async with httpx.AsyncClient() as client:
+        r = await client.post(
+            messages_url,
+            data={"From": from_number, "To": my_number, "Body": hook_text},
+            auth=(twilio_sid, twilio_token),
+            timeout=15,
+        )
+        if r.status_code >= 400:
+            logger.error("Failed to send curiosity hook: %s", r.text)
+            return
+
+    redis.set("microlearn:last_hook_date", json.dumps(today))
+    logger.info("Curiosity hook sent for %s.", today)
+
+
 async def run_worker() -> None:
     await check_and_send_morning_recall()
     await check_and_send_afternoon_story()
+    await check_and_send_curiosity_hook()
     await check_and_send_daily_report()
 
     twilio_sid = os.environ["TWILIO_ACCOUNT_SID"]
