@@ -1313,6 +1313,53 @@ async def _handle_settings_command(sender: str, cmd: str) -> None:
         await _handle_teach_me(sender)
 
 
+async def _maybe_send_enrichment(sender: str, user_text: str) -> None:
+    """
+    If the message is substantive (>6 words) and mentions something interesting,
+    send a surprising fact or reframe as a plain text message before the normal reply.
+    Two fast Claude calls: first YES/NO gate, then fact generation.
+    """
+    if len(user_text.split()) <= 6:
+        return
+
+    import anthropic as _anthropic
+    _claude = _anthropic.AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+
+    try:
+        gate = await _claude.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=5,
+            messages=[{"role": "user", "content": (
+                f"Does this message mention a specific place, historical figure, empire, "
+                f"time period, scientific concept, or domain? Reply only YES or NO.\n\n{user_text}"
+            )}],
+        )
+        if not gate.content[0].text.strip().upper().startswith("YES"):
+            return
+    except Exception as e:
+        logger.warning("Enrichment gate call failed (non-fatal): %s", e)
+        return
+
+    try:
+        fact_resp = await _claude.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=120,
+            messages=[{"role": "user", "content": (
+                f"The user just mentioned something interesting in this message: '{user_text}'. "
+                "Generate one compelling fact or reframe about it that connects to something a "
+                "curious person would find surprising. Max 2 sentences. Casual tone, like a "
+                "knowledgeable friend."
+            )}],
+        )
+        fact_text = fact_resp.content[0].text.strip()
+    except Exception as e:
+        logger.warning("Enrichment fact call failed (non-fatal): %s", e)
+        return
+
+    await _send_text_now(sender, fact_text)
+    logger.info("Sent enrichment fact to %s", sender)
+
+
 @app.post("/webhook")
 async def webhook(
     request: Request,
@@ -1412,6 +1459,9 @@ async def webhook(
         consumed = await _handle_quiz_state(sender, user_text, quiz_state)
         if consumed:
             return PlainTextResponse("", status_code=200)
+
+    # Enrichment: send a surprising fact before the normal reply if message is substantive
+    await _maybe_send_enrichment(sender, user_text)
 
     # Save transcript (fire and forget — don't block reply generation)
     asyncio.create_task(_save_transcript(user_text, is_voice_note))
