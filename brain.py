@@ -418,4 +418,6 @@ async def get_reply(user_message: str, sender: str = "") -> tuple[str, dict[str,
     await store_message("user", user_message)
     await store_message("assistant", reply)
 
-    return reply, kg_update
+    diagram_url = await maybe_generate_diagram(reply)
+
+    return reply, kg_update, diagram_url

@@ -1417,7 +1417,7 @@ async def webhook(
     asyncio.create_task(_save_transcript(user_text, is_voice_note))
 
     try:
-        reply_text, _kg = await get_reply(user_text, sender)
+        reply_text, _kg, diagram_url = await get_reply(user_text, sender)
     except Exception as e:
         logger.error("Brain call failed: %s", e)
         return PlainTextResponse("", status_code=200)
@@ -1432,6 +1432,24 @@ async def webhook(
 
     # Send main reply immediately as voice note
     await _send_voice_now(sender, clean_reply)
+
+    # Send contextual diagram if one was generated
+    if diagram_url:
+        twilio_sid = os.environ["TWILIO_ACCOUNT_SID"]
+        twilio_token = os.environ["TWILIO_AUTH_TOKEN"]
+        from_number = os.environ["TWILIO_WHATSAPP_NUMBER"]
+        messages_url = f"https://api.twilio.com/2010-04-01/Accounts/{twilio_sid}/Messages.json"
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                messages_url,
+                data={"From": from_number, "To": sender, "MediaUrl": diagram_url},
+                auth=(twilio_sid, twilio_token),
+                timeout=15,
+            )
+            if resp.status_code >= 400:
+                logger.error("Failed to send diagram to %s: %s", sender, resp.text)
+            else:
+                logger.info("Sent diagram to %s: %s", sender, diagram_url)
 
     # If end of session, send a short closing message so user knows to come back later
     if end_session:
